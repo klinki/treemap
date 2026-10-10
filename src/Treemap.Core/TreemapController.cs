@@ -44,13 +44,14 @@ public sealed class TreemapController
     private int _focusRootNodeId = -1;
     private ChangeKind _pending = ChangeKind.All;
 
-    public TreemapController(SnapshotPublisher publisher, LayoutOptions? options = null)
+    public TreemapController(
+        SnapshotPublisher publisher, LayoutOptions? options = null, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(publisher);
 
         _publisher = publisher;
         _options = options ?? LayoutOptions.Default;
-        _animator = new TreemapAnimator();
+        _animator = new TreemapAnimator(timeProvider: timeProvider);
         _focusRootNodeId = publisher.Current.Root.Id;
         _camera.FitToContent(ContentBounds, _viewport);
     }
@@ -144,25 +145,31 @@ public sealed class TreemapController
     /// <summary>The current animated frame, ready to render.</summary>
     public IReadOnlyList<TweenedCell> CurrentFrame => _animator.CurrentFrame;
 
-    /// <summary>Advances any running animation. Returns true if a repaint is needed.</summary>
+    /// <summary>
+    /// Advances any running animation. Returns true if a repaint is needed, which
+    /// includes the frame that settles the transition.
+    /// </summary>
     public bool Advance()
     {
-        bool animating = _animator.Advance();
-        if (animating)
+        bool repaint = _animator.Advance();
+        if (repaint)
         {
             Raise(ChangeKind.Layout);
         }
 
-        return animating;
+        return repaint;
     }
 
     // ---- input ----
 
-    /// <summary>Handles pointer movement in screen coordinates.</summary>
+    /// <summary>
+    /// Handles pointer movement in screen coordinates. Hover resolves against the
+    /// frame currently on screen, not the layout the transition is heading for, so
+    /// the highlight tracks the cells the user can actually see.
+    /// </summary>
     public void PointerMoved(float x, float y)
     {
-        PointF content = _camera.ScreenToContent(new PointF(x, y));
-        int hit = HitTester.HitTestContent(_layout, content.X, content.Y);
+        int hit = HitAt(x, y);
 
         if (hit != _hoveredNodeId)
         {
@@ -174,14 +181,19 @@ public sealed class TreemapController
     /// <summary>Handles a left click: select, or drill into a folder on double-click.</summary>
     public void Click(float x, float y)
     {
-        PointF content = _camera.ScreenToContent(new PointF(x, y));
-        int hit = HitTester.HitTestContent(_layout, content.X, content.Y);
+        int hit = HitAt(x, y);
 
         if (hit != _selectedNodeId)
         {
             _selectedNodeId = hit;
             Raise(ChangeKind.Selection);
         }
+    }
+
+    private int HitAt(float screenX, float screenY)
+    {
+        PointF content = _camera.ScreenToContent(new PointF(screenX, screenY));
+        return HitTester.HitTestFrameContent(_animator.CurrentFrame, content.X, content.Y);
     }
 
     /// <summary>Zooms by a wheel notch, anchored at the cursor.</summary>

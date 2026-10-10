@@ -30,6 +30,13 @@ namespace Treemap.Host.WinForms;
 /// <see cref="SKBitmap"/> bound directly over its pixels. Skia therefore rasterises straight
 /// into the blit source: there is no intermediate copy and no SkiaSharp.Views dependency.
 /// </para>
+///
+/// <para>
+/// The view also subscribes to <see cref="SnapshotPublisher.Published"/>, so a producer only
+/// has to call <c>Publish</c> from any background thread to drive the UI. Notifications are
+/// coalesced into a single posted callback that always consumes the newest snapshot, and the
+/// 16 ms timer runs only while a transition is in flight.
+/// </para>
 /// </remarks>
 public sealed class TreemapForm : Control
 {
@@ -45,13 +52,19 @@ public sealed class TreemapForm : Control
     private readonly TreemapController _controller;
     private readonly TreemapRenderer _renderer;
     private readonly RenderState _renderState;
+    private readonly SnapshotPublisher _publisher;
     private readonly System.Windows.Forms.Timer _timer;
 
     private Bitmap? _backBuffer;
     private SKBitmap? _bitmap;
     private SKImageInfo _bitmapInfo;
 
-    private bool _disposed;
+    private int _publishPending;
+    private int _updateScheduled;
+
+    // Read from the publishing thread as well as the UI thread.
+    private volatile bool _disposed;
+    private bool _initialized;
     private bool _dragging;
     private bool _movedWhileDown;
     private Point _dragOrigin;
@@ -60,6 +73,8 @@ public sealed class TreemapForm : Control
     public TreemapForm(SnapshotPublisher publisher, Func<int, string>? nameResolver = null)
     {
         ArgumentNullException.ThrowIfNull(publisher);
+
+        _publisher = publisher;
 
         _controller = new TreemapController(publisher, new LayoutOptions
         {
@@ -97,14 +112,18 @@ public sealed class TreemapForm : Control
         TabStop = true;
         Cursor = Cursors.Hand;
 
-        _controller.Changed += OnControllerChanged;
-
+        // Both subscriptions below can fire from the very next line on, so the timer has to
+        // exist before either of them is attached.
         _timer = new System.Windows.Forms.Timer { Interval = 16 };
         _timer.Tick += OnTick;
 
-        EnsureBackBuffer();
-        SyncViewport(animate: false);
-        _timer.Start();
+        _controller.Changed += OnControllerChanged;
+        _publisher.Published += OnPublished;
+
+        SyncViewport();
+        _controller.Relayout(animate: false);
+        _initialized = true;
+        SyncTimer();
     }
 
     /// <summary>The controller, exposed so a shell can drive navigation or re-publish snapshots.</summary>
@@ -115,19 +134,29 @@ public sealed class TreemapForm : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        SyncViewport(animate: false);
+
+        // The style and property assignments in the constructor raise this, and the
+        // constructor does the initial sizing itself once everything exists.
+        if (!_initialized)
+        {
+            return;
+        }
+
+        // The layout is always the same fixed 1000x1000 content rect, so a resize only
+        // changes the back buffer and refits the camera. Relaying out here would restart
+        // a running transition, and interrupting a tween jumps to the previous target.
+        SyncViewport();
     }
 
     /// <summary>
-    /// Keeps the back buffer, the controller viewport and the layout in step. Resizing re-fits
-    /// the camera once (the controller only fits when the viewport was previously unset) and
-    /// relayouts without animation, because a resize is not a transition the user asked for.
+    /// Keeps the back buffer and the controller viewport in step with the control size.
+    /// The camera refits whenever the size changes, so the treemap keeps filling the
+    /// window without the caller having to ask for a relayout.
     /// </summary>
-    private void SyncViewport(bool animate)
+    private void SyncViewport()
     {
         EnsureBackBuffer();
         _controller.SetViewport(new RectF(0, 0, Width, Height));
-        _controller.Relayout(animate);
         Invalidate();
     }
 
@@ -228,14 +257,133 @@ public sealed class TreemapForm : Control
 
     // ---- render loop ----
 
-    private void OnControllerChanged(ChangeKind kind) => Invalidate();
+    private void OnControllerChanged(ChangeKind kind)
+    {
+        SyncTimer();
+        Invalidate();
+    }
 
     private void OnTick(object? sender, EventArgs e)
     {
-        if (_controller.Advance())
+        bool repaint = _controller.Advance();
+
+        // Advance reports the settling frame too, so repaint first and only then decide
+        // whether the timer still has a reason to exist.
+        if (repaint)
         {
             Invalidate();
         }
+
+        SyncTimer();
+    }
+
+    /// <summary>
+    /// Runs the timer only while a transition is in flight. An idle timer would wake the
+    /// UI 60 times a second to do nothing.
+    /// </summary>
+    private void SyncTimer()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (_controller.IsAnimating)
+        {
+            _timer.Start();
+        }
+        else
+        {
+            _timer.Stop();
+        }
+    }
+
+    // ---- publication ----
+
+    /// <summary>
+    /// Runs on whichever thread called <c>Publish</c>. It only sets a flag and posts one
+    /// callback; no UI is touched here.
+    /// </summary>
+    private void OnPublished()
+    {
+        Volatile.Write(ref _publishPending, 1);
+        ScheduleSnapshotUpdate();
+    }
+
+    /// <summary>
+    /// Posts a single callback for a burst of publishes, so a scanner publishing a hundred
+    /// snapshots between two paints causes one relayout, not a hundred.
+    /// </summary>
+    private void ScheduleSnapshotUpdate()
+    {
+        if (_disposed || !IsHandleCreated || Volatile.Read(ref _publishPending) == 0)
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _updateScheduled, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            BeginInvoke(new Action(ApplyPendingSnapshot));
+        }
+        catch (ObjectDisposedException)
+        {
+            Interlocked.Exchange(ref _updateScheduled, 0);
+        }
+        catch (InvalidOperationException) when (_disposed || !IsHandleCreated)
+        {
+            // The handle went away between the check above and the post. OnHandleCreated
+            // will repost once it exists again. Any other invalid-operation is a real
+            // fault and is left to propagate.
+            Interlocked.Exchange(ref _updateScheduled, 0);
+        }
+    }
+
+    /// <summary>
+    /// Consumes the newest snapshot. Notifications may arrive out of version order, so the
+    /// frame is read from the publisher rather than from the notification itself.
+    /// </summary>
+    private void ApplyPendingSnapshot()
+    {
+        // Clear the scheduled flag first: a publish arriving from here on re-arms both
+        // flags and posts its own callback, which is what keeps it from being lost.
+        Interlocked.Exchange(ref _updateScheduled, 0);
+
+        if (_disposed || !IsHandleCreated)
+        {
+            return;
+        }
+
+        // Handle recreation can resurrect a post for a notification that was already
+        // consumed. Relayouting on that would restart any transition in flight.
+        if (Interlocked.Exchange(ref _publishPending, 0) == 0)
+        {
+            return;
+        }
+
+        _controller.Relayout(animate: true);
+        Invalidate();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+
+        // Covers a publish that arrived before the handle existed, and one whose callback
+        // was dropped when an earlier handle was destroyed.
+        ScheduleSnapshotUpdate();
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        // A post that has not been dispatched dies with the handle, so hand the schedule
+        // flag back rather than leaving publications permanently unconsumed.
+        Interlocked.Exchange(ref _updateScheduled, 0);
+        base.OnHandleDestroyed(e);
     }
 
     // ---- pointer ----
@@ -409,11 +557,12 @@ public sealed class TreemapForm : Control
         {
             _disposed = true;
 
+            _publisher.Published -= OnPublished;
+            _controller.Changed -= OnControllerChanged;
+
             _timer.Stop();
             _timer.Tick -= OnTick;
             _timer.Dispose();
-
-            _controller.Changed -= OnControllerChanged;
             _renderer.Dispose();
 
             _bitmap?.Dispose();

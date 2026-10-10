@@ -1,12 +1,11 @@
 using BenchmarkDotNet.Columns;
 using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Diagnosers;
-using BenchmarkDotNet.Jobs;
 
 namespace Treemap.Performance;
 
 /// <summary>
-/// Shared benchmark configuration.
+/// Shared benchmark configuration: columns and the memory diagnoser, nothing else.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -18,9 +17,22 @@ namespace Treemap.Performance;
 ///
 /// <para>
 /// <b>Memory:</b> tree generation dominates allocation, so <see cref="MaxFileCount"/>
-/// caps sizes and each benchmark class builds only what it needs. An earlier draft
-/// materialised 500K/100K/10K/1K-node trees simultaneously in one setup, which is
-/// several GB of live <c>TreemapNode</c> objects before BDN even starts iterating.
+/// caps sizes and each benchmark class builds only what it needs, retaining at most two
+/// trees at a time.
+/// </para>
+///
+/// <para>
+/// <b>No job is declared here.</b> The run job is attached exactly once, globally, by
+/// <see cref="Program"/> and marked as the default, so a caller-supplied
+/// <c>--job dry</c> or <c>--job short</c> replaces it instead of producing a second job
+/// alongside this config.
+/// </para>
+///
+/// <para>
+/// <b>No managed heap limit here.</b> Process and job memory are capped by the kernel
+/// job object in <c>tools/Invoke-Bounded.ps1</c>, and every benchmark child process
+/// inherits those caps. A managed heap limit here could only be looser than the parent
+/// cap and would add nothing.
 /// </para>
 /// </remarks>
 public sealed class PerfConfig : ManualConfig
@@ -28,22 +40,9 @@ public sealed class PerfConfig : ManualConfig
     /// <summary>Hard ceiling on generated tree size, in files.</summary>
     public const int MaxFileCount = 100_000;
 
-    /// <summary>
-    /// 2 GiB managed heap ceiling applied to each benchmark child process. Far more
-    /// than any benchmark here needs, but it converts a runaway allocation into a
-    /// clean OutOfMemoryException in one process instead of exhausting the machine.
-    /// </summary>
-    internal const string HeapHardLimitHex = "0x80000000";
-
     public PerfConfig()
     {
-        AddJob(Job.Default
-            .WithGcServer(false)
-            .WithEnvironmentVariable("DOTNET_GCHeapHardLimit", HeapHardLimitHex)
-            .WithEnvironmentVariable("DOTNET_gcServer", "0"));
-
         AddColumnProvider(DefaultColumnProviders.Instance);
         AddDiagnoser(MemoryDiagnoser.Default);
-        WithOptions(ConfigOptions.DisableOptimizationsValidator);
     }
 }

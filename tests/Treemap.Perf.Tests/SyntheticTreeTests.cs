@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using Treemap;
 using Xunit;
@@ -16,19 +17,28 @@ namespace Treemap.Performance.Tests;
 /// </para>
 ///
 /// <para>
-/// The tests below are the regression net for that class of bug. They assert the two
-/// properties that matter: generation <b>terminates</b>, and it produces <b>exactly</b>
-/// the requested number of files. Running them against a 1-second timeout makes a
-/// regression fail fast instead of consuming the machine first.
+/// The tests below are the regression net for that class of bug. They assert that
+/// generation <b>terminates</b> and produces <b>exactly</b> the requested number of
+/// files, and that concurrent builds stay isolated from one another.
+/// </para>
+///
+/// <para>
+/// There is no in-test hard timeout. An earlier version ran generation on a background
+/// thread and asserted that <c>Task.Wait</c> returned, which proves nothing: the waiting
+/// thread cannot stop the runaway build, and the test host still holds every node the
+/// build allocated. Trees here are generated synchronously and kept small (1,000 files
+/// is the largest case). Elapsed time is measured with a stopwatch and reported as a
+/// signal, not enforced as a timeout. A runaway build is terminated by the external
+/// bounded runner, which caps memory and kills the whole job at its deadline.
 /// </para>
 /// </remarks>
 public class SyntheticTreeTests
 {
     /// <summary>
-    /// Hard timeout for generation. The buggy version never returned, so without this
-    /// the suite itself would hang and exhaust memory before any assertion ran.
+    /// Reported budget for the small-tree cases. Not a timeout: nothing enforces it,
+    /// it only makes a large regression obvious in the failure message.
     /// </summary>
-    private static readonly TimeSpan GenerationTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan SmallTreeBudget = TimeSpan.FromSeconds(5);
 
     [Theory]
     [InlineData(1)]
@@ -54,17 +64,18 @@ public class SyntheticTreeTests
     [InlineData(5)]
     public void SmallTreesCompleteQuickly(int requested)
     {
-        // The specific counts from the bug report: these are the values where the
-        // direct-file percentage truncated to zero.
-        long start = Environment.TickCount64;
+        // The counts from the bug report: these are the values where the direct-file
+        // percentage truncated to zero.
+        Stopwatch clock = Stopwatch.StartNew();
 
         TreemapNode root = Generate(requested);
 
-        long elapsed = Environment.TickCount64 - start;
+        clock.Stop();
 
         Assert.Equal(requested, CountFiles(root));
-        Assert.True(elapsed < GenerationTimeout.TotalMilliseconds,
-            $"generation took {elapsed}ms, expected well under {GenerationTimeout.TotalMilliseconds}ms");
+        Assert.True(clock.Elapsed < SmallTreeBudget,
+            $"generation took {clock.ElapsedMilliseconds}ms, " +
+            $"expected well under {SmallTreeBudget.TotalMilliseconds}ms");
     }
 
     [Fact]
@@ -77,14 +88,57 @@ public class SyntheticTreeTests
     }
 
     [Fact]
+    public void IdsAreUniqueWithinATree()
+    {
+        TreemapNode root = Generate(500);
+
+        List<int> ids = Ids(root);
+
+        Assert.Equal(ids.Count, ids.Distinct().Count());
+    }
+
+    [Fact]
     public void GenerationIsDeterministicForAGivenSeed()
     {
-        // Same seed must produce the same shape, otherwise benchmark runs are not
-        // comparable across machines.
+        // Same seed must produce the same shape and the same ids, otherwise benchmark
+        // runs are not comparable across machines.
         TreemapNode first = Generate(200, seed: 4242);
         TreemapNode second = Generate(200, seed: 4242);
 
         Assert.Equal(Describe(first), Describe(second));
+
+        Assert.Equal<int>(Ids(first), Ids(second));
+    }
+
+    /// <summary>
+    /// Ids used to come from a static counter that <c>Build</c> reset on entry. Concurrent
+    /// builds reset and advanced each other's counter, so ids repeated inside a single
+    /// tree and the same seed no longer produced the same tree.
+    /// </summary>
+    [Fact]
+    public void ConcurrentSameSeedBuildsStayIsolatedAndIdentical()
+    {
+        const int Builds = 4;
+        const int Files = 100;
+
+        TreemapNode[] trees = new TreemapNode[Builds];
+        Parallel.For(0, Builds, i => trees[i] = SyntheticTree.Build(Files, seed: 4242));
+
+        string expectedShape = Describe(trees[0]);
+        List<int> expectedIds = Ids(trees[0]);
+
+        Assert.Equal(expectedIds.Count, expectedIds.Distinct().Count());
+        Assert.Equal(Files, CountFiles(trees[0]));
+
+        for (int i = 1; i < Builds; i++)
+        {
+            List<int> ids = Ids(trees[i]);
+
+            Assert.Equal(expectedIds.Count, ids.Distinct().Count());
+            Assert.Equal<int>(expectedIds, ids);
+            Assert.Equal(expectedShape, Describe(trees[i]));
+            Assert.Equal(Files, CountFiles(trees[i]));
+        }
     }
 
     [Fact]
@@ -116,18 +170,8 @@ public class SyntheticTreeTests
         Assert.Contains(root.Children, c => c.Kind == NodeKind.FreeSpace);
     }
 
-    /// <summary>Runs generation on a background thread with a hard timeout.</summary>
     private static TreemapNode Generate(int fileCount, int seed = 12345)
-    {
-        Task<TreemapNode> task = Task.Run(() => SyntheticTree.Build(fileCount, seed));
-
-        Assert.True(
-            task.Wait(GenerationTimeout),
-            $"SyntheticTree.Build({fileCount}) did not complete within " +
-            $"{GenerationTimeout.TotalSeconds}s -- the generator is not making progress");
-
-        return task.Result;
-    }
+        => SyntheticTree.Build(fileCount, seed);
 
     private static int CountFiles(TreemapNode root)
     {
@@ -164,6 +208,8 @@ public class SyntheticTreeTests
         }
     }
 
+    private static List<int> Ids(TreemapNode root) => [.. Enumerate(root).Select(n => n.Id)];
+
     private static string Describe(TreemapNode node)
     {
         StringBuilder sb = new();
@@ -173,7 +219,11 @@ public class SyntheticTreeTests
 
     private static void Walk(TreemapNode node, StringBuilder sb, int depth)
     {
-        sb.Append(node.Kind).Append(':').Append(node.Name).Append(':').Append(depth).Append(';');
+        sb.Append(node.Id).Append(':')
+          .Append(node.Kind).Append(':')
+          .Append(node.Name).Append(':')
+          .Append(depth).Append(';');
+
         foreach (TreemapNode child in node.Children)
         {
             Walk(child, sb, depth + 1);

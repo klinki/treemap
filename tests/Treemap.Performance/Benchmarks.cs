@@ -6,13 +6,12 @@ using Treemap.Skia;
 namespace Treemap.Performance;
 
 /// <summary>
-/// Builds each tree once, on demand, and never holds more than the current one.
+/// Builds each tree on demand and retains a bounded number of them, so no benchmark
+/// pays to build a tree it is not measuring.
 /// </summary>
 /// <remarks>
-/// The earlier version created every tree up front in <c>GlobalSetup</c>, which meant
-/// a 500K-node tree, a 100K-node tree and several smaller ones were all resident at
-/// the same time. This lazy cache keeps at most one live at a time, and callers are
-/// expected to drop their reference via <see cref="Release"/> between benchmarks.
+/// Trees are evicted oldest-first once <c>MaxRetained</c> is reached, and freed when
+/// the cache is disposed.
 /// </remarks>
 public sealed class TreeCache : IDisposable
 {
@@ -61,9 +60,8 @@ public sealed class TreeCache : IDisposable
 /// Layout throughput: the squarified treemap over large trees.
 /// </summary>
 /// <remarks>
-/// Sizes stop at 100K. That is already ~100MB of <c>TreemapNode</c> objects and
-/// represents a genuinely large disk; a 500K case measured little extra except RAM
-/// pressure, so it was dropped rather than kept as a foot-gun.
+/// Sizes stop at 100K nodes, which is the largest case that stays inside the memory
+/// budget these benchmarks run under. <c>PerfConfig.MaxFileCount</c> is the hard cap.
 /// </remarks>
 [Config(typeof(PerfConfig))]
 [MemoryDiagnoser]
@@ -137,8 +135,7 @@ public class RenderBenchmarks
         _canvas = new SKCanvas(_bitmap);
         _renderer = new TreemapRenderer { NameResolver = id => $"node-{id}.dll" };
 
-        // 50K is the realistic upper bound for a single interactive view and keeps
-        // the resident layout well under the heap cap.
+        // Sized to keep the resident layout well under the heap cap PerfConfig sets.
         _tree = _trees.Get(50_000);
         _layout = SquarifyLayout.Compute(_tree, new RectF(0, 0, Width, Height), new LayoutOptions { InnerPadding = 1f });
         _frame = RenderBenchmarksShared.ToFrame(_layout);
@@ -185,6 +182,7 @@ internal static class RenderBenchmarksShared
                 AreaFraction = layout.AreaFractions[i],
                 HasChildren = layout.HasChildren[i],
                 IsEntering = false,
+                ParentIndex = layout.ParentIndices[i],
             });
         }
 
@@ -257,14 +255,18 @@ public class TweenBenchmarks
         RectF viewport = new(0, 0, 1920, 1080);
         LayoutOptions options = new() { InnerPadding = 1f };
 
+        // Draw order, parent links and depths are resolved by the constructor, so
+        // the steady-state cost below is a single pass over the cell list.
         _tween = new LayoutTween(
             SquarifyLayout.Compute(before, viewport, options),
             SquarifyLayout.Compute(after, viewport, options));
     }
 
     /// <summary>
-    /// The hot path the MemoryDiagnoser is aimed at: it reveals whether
-    /// <c>Evaluate</c> allocates a fresh list and sorts per frame.
+    /// The hot path the MemoryDiagnoser is aimed at. The tween resolves its draw
+    /// order once at construction, so <c>Evaluate</c> is expected to report no
+    /// per-call allocation; a non-zero figure here means ordering or sorting crept
+    /// back into the per-frame path.
     /// </summary>
     [Benchmark(Baseline = true, Description = "LayoutTween.Evaluate (per frame)")]
     public int Evaluate()

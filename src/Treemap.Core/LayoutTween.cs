@@ -41,6 +41,13 @@ public static class Easing
 /// Matching is by <see cref="TreemapNode.Id"/>, so the tree may change shape
 /// entirely between snapshots as long as stable ids are used.
 /// </para>
+///
+/// <para>
+/// Draw order is decided once, when the tween is built, and does not depend on
+/// progress: every cell's parent is painted before it. Sorting per frame by alpha
+/// or depth could not honour that, because a fading-in parent has a lower alpha
+/// than the retained child it now contains and would be painted over it.
+/// </para>
 /// </remarks>
 public sealed class LayoutTween
 {
@@ -49,6 +56,49 @@ public sealed class LayoutTween
 
     /// <summary>Node ids present in <see cref="_from"/> but not <see cref="_to"/>.</summary>
     private readonly List<int> _removedIds;
+
+    /// <summary>
+    /// The frame's cells in final draw order, with everything that does not vary
+    /// between frames already resolved: which endpoint a cell reads from, its
+    /// parent and its depth. Built once, so <see cref="Evaluate"/> is a flat loop
+    /// that neither allocates nor sorts.
+    /// </summary>
+    private readonly PlanEntry[] _plan;
+
+    /// <summary>One cell of the union of both layouts, before draw order is decided.</summary>
+    private struct UnionCell
+    {
+        public int NodeId;
+
+        /// <summary>Index into <see cref="_from"/>, or -1 when the cell is entering.</summary>
+        public int FromIndex;
+
+        /// <summary>Index into <see cref="_to"/>, or -1 when the cell is departing.</summary>
+        public int ToIndex;
+
+        /// <summary>Slot of this cell's effective parent, or -1 for a frame root.</summary>
+        public int ParentSlot;
+    }
+
+    /// <summary>One frame cell, holding only the parts constant across progress.</summary>
+    private struct PlanEntry
+    {
+        public int NodeId;
+
+        /// <summary>Index into <see cref="_from"/>, or -1 when the cell is entering.</summary>
+        public int FromIndex;
+
+        /// <summary>Index into <see cref="_to"/>, or -1 when the cell is departing.</summary>
+        public int ToIndex;
+
+        /// <summary>Frame index of this cell's parent, or -1 for a frame root.</summary>
+        public int ParentFrameIndex;
+
+        /// <summary>Depth in the frame's own hierarchy, not in either endpoint's.</summary>
+        public int Depth;
+
+        public bool IsEntering => FromIndex < 0;
+    }
 
     public LayoutTween(LayoutResult from, LayoutResult to)
     {
@@ -66,6 +116,8 @@ public sealed class LayoutTween
                 _removedIds.Add(i);
             }
         }
+
+        _plan = BuildPlan();
     }
 
     /// <summary>True when both endpoints describe the same set of cells.</summary>
@@ -83,72 +135,214 @@ public sealed class LayoutTween
         output.Clear();
 
         float t = Easing.CubicInOut(progress);
+        PlanEntry[] plan = _plan;
 
-        // --- nodes present in the target: lerp, or fade in if newly added ---
-        for (int i = 0; i < _to.Count; i++)
+        for (int i = 0; i < plan.Length; i++)
         {
-            int id = _to.NodeIds[i];
+            // Frame position is the loop index, so ParentFrameIndex is already the
+            // cell's index within the output list.
+            ref readonly PlanEntry entry = ref plan[i];
 
-            if (_from.TryGetIndex(id, out int fromIndex))
+            if (entry.ToIndex < 0)
             {
-                RectF a = _from.Bounds[fromIndex];
-                RectF b = _to.Bounds[i];
-
+                // Disappeared: fade out where it was.
+                int source = entry.FromIndex;
                 output.Add(new TweenedCell
                 {
-                    NodeId = id,
-                    Bounds = RectF.Lerp(a, b, t),
-                    Alpha = 1f,
-                    Depth = _to.Depths[i],
-                    Kind = _to.Kinds[i],
-                    ColorGroup = _to.ColorGroups[i],
-                    AreaFraction = _to.AreaFractions[i],
-                    HasChildren = _to.HasChildren[i],
+                    NodeId = entry.NodeId,
+                    Bounds = _from.Bounds[source],
+                    Alpha = 1f - t,
+                    Depth = entry.Depth,
+                    Kind = _from.Kinds[source],
+                    ColorGroup = _from.ColorGroups[source],
+                    AreaFraction = _from.AreaFractions[source],
+                    HasChildren = _from.HasChildren[source],
                     IsEntering = false,
+                    ParentIndex = entry.ParentFrameIndex,
+                });
+            }
+            else if (entry.IsEntering)
+            {
+                // Newly discovered node: fade in at its final position.
+                int target = entry.ToIndex;
+                output.Add(new TweenedCell
+                {
+                    NodeId = entry.NodeId,
+                    Bounds = _to.Bounds[target],
+                    Alpha = t,
+                    Depth = entry.Depth,
+                    Kind = _to.Kinds[target],
+                    ColorGroup = _to.ColorGroups[target],
+                    AreaFraction = _to.AreaFractions[target],
+                    HasChildren = _to.HasChildren[target],
+                    IsEntering = true,
+                    ParentIndex = entry.ParentFrameIndex,
                 });
             }
             else
             {
-                // Newly discovered node: fade in at its final position.
+                // In both layouts: interpolate towards the target rect.
+                int source = entry.FromIndex;
+                int target = entry.ToIndex;
                 output.Add(new TweenedCell
                 {
-                    NodeId = id,
-                    Bounds = _to.Bounds[i],
-                    Alpha = t,
-                    Depth = _to.Depths[i],
-                    Kind = _to.Kinds[i],
-                    ColorGroup = _to.ColorGroups[i],
-                    AreaFraction = _to.AreaFractions[i],
-                    HasChildren = _to.HasChildren[i],
-                    IsEntering = true,
+                    NodeId = entry.NodeId,
+                    Bounds = RectF.Lerp(_from.Bounds[source], _to.Bounds[target], t),
+                    Alpha = 1f,
+                    Depth = entry.Depth,
+                    Kind = _to.Kinds[target],
+                    ColorGroup = _to.ColorGroups[target],
+                    AreaFraction = _to.AreaFractions[target],
+                    HasChildren = _to.HasChildren[target],
+                    IsEntering = false,
+                    ParentIndex = entry.ParentFrameIndex,
                 });
             }
         }
+    }
 
-        // --- nodes that disappeared: fade out in place ---
-        for (int k = 0; k < _removedIds.Count; k++)
+    /// <summary>
+    /// Resolves draw order, parent links and depths once, for the whole transition.
+    /// </summary>
+    /// <remarks>
+    /// The order is a topological walk of the union of both trees. Departing cells
+    /// are seeded first, each preceded by the ancestors it still shares with the
+    /// frame, because a departing cell never moves: painting it after the retained
+    /// child it used to contain would hide that child behind it for the whole
+    /// transition. Retained and entering cells then follow in the target's own
+    /// order.
+    ///
+    /// <para>
+    /// The one case no single order can satisfy is two retained cells that swap
+    /// parents between the endpoints: the frame can only honour one of the two
+    /// hierarchies, and it honours the target, so at progress 0 such a cell is
+    /// painted under whichever parent it is moving out of.
+    /// </para>
+    /// </remarks>
+    private PlanEntry[] BuildPlan()
+    {
+        int count = _to.Count + _removedIds.Count;
+
+        // Slots are target cells in target order, then departing cells in source
+        // order. In that arrangement every cell's parent already has a smaller slot,
+        // which is what makes the walk below a single visit per cell.
+        UnionCell[] cells = new UnionCell[count];
+        Dictionary<int, int> slotById = new(count);
+
+        int next = 0;
+
+        for (int i = 0; i < _to.Count; i++)
         {
-            int i = _removedIds[k];
-            output.Add(new TweenedCell
-            {
-                NodeId = _from.NodeIds[i],
-                Bounds = _from.Bounds[i],
-                Alpha = 1f - t,
-                Depth = _from.Depths[i],
-                Kind = _from.Kinds[i],
-                ColorGroup = _from.ColorGroups[i],
-                AreaFraction = _from.AreaFractions[i],
-                HasChildren = _from.HasChildren[i],
-                IsEntering = false,
-            });
+            int id = _to.NodeIds[i];
+
+            // TryGetIndex yields default(T) on a miss, which would make every
+            // entering node read its geometry out of source cell 0 — and index an
+            // empty source at all. Absence has to be spelled out.
+            int fromIndex = _from.TryGetIndex(id, out int found) ? found : -1;
+
+            slotById[id] = next;
+            cells[next] = new UnionCell { NodeId = id, FromIndex = fromIndex, ToIndex = i };
+            next++;
         }
 
-        // Draw order: deeper cells last so nested content sits on top.
-        output.Sort(static (a, b) =>
+        foreach (int i in _removedIds)
         {
-            int byAlpha = b.Alpha.CompareTo(a.Alpha);
-            return byAlpha != 0 ? byAlpha : a.Depth.CompareTo(b.Depth);
-        });
+            int id = _from.NodeIds[i];
+            slotById[id] = next;
+            cells[next] = new UnionCell { NodeId = id, FromIndex = i, ToIndex = -1 };
+            next++;
+        }
+
+        // Effective parent: the target's for anything the target still owns, so an
+        // entering parent is followed by the retained children it now contains, and
+        // the source's for a departing cell, whose parent may itself have moved.
+        for (int i = 0; i < count; i++)
+        {
+            int parentNodeId = cells[i].ToIndex >= 0
+                ? ParentNodeId(_to, cells[i].ToIndex)
+                : ParentNodeId(_from, cells[i].FromIndex);
+
+            cells[i].ParentSlot =
+                parentNodeId >= 0 && slotById.TryGetValue(parentNodeId, out int slot) ? slot : -1;
+        }
+
+        int[] order = new int[count];
+        int[] frameIndex = new int[count];
+        bool[] emitted = new bool[count];
+        List<int> pending = [];
+        int emittedCount = 0;
+
+        void Emit(int seed)
+        {
+            if (emitted[seed])
+            {
+                return;
+            }
+
+            // Climb to the first ancestor that is not on screen yet, then emit
+            // downwards from it, so a parent is never painted after its child.
+            pending.Clear();
+            int current = seed;
+            while (!emitted[current])
+            {
+                pending.Add(current);
+                int parent = cells[current].ParentSlot;
+                if (parent < 0)
+                {
+                    break;
+                }
+
+                current = parent;
+            }
+
+            while (pending.Count > 0)
+            {
+                int slot = pending[^1];
+                pending.RemoveAt(pending.Count - 1);
+
+                emitted[slot] = true;
+                frameIndex[slot] = emittedCount;
+                order[emittedCount] = slot;
+                emittedCount++;
+            }
+        }
+
+        for (int i = 0; i < _removedIds.Count; i++)
+        {
+            Emit(_to.Count + i);
+        }
+
+        for (int i = 0; i < _to.Count; i++)
+        {
+            Emit(i);
+        }
+
+        // Remap to the emitted order. Parents come first, so parent indices and
+        // depths — which must agree with the hierarchy the frame actually carries —
+        // both fall out of one forward pass.
+        PlanEntry[] plan = new PlanEntry[count];
+        for (int i = 0; i < count; i++)
+        {
+            UnionCell cell = cells[order[i]];
+            int parent = cell.ParentSlot;
+
+            plan[i] = new PlanEntry
+            {
+                NodeId = cell.NodeId,
+                FromIndex = cell.FromIndex,
+                ToIndex = cell.ToIndex,
+                ParentFrameIndex = parent >= 0 ? frameIndex[parent] : -1,
+                Depth = parent >= 0 ? plan[frameIndex[parent]].Depth + 1 : 0,
+            };
+        }
+
+        return plan;
+    }
+
+    private static int ParentNodeId(LayoutResult layout, int cellIndex)
+    {
+        int parent = layout.ParentIndices[cellIndex];
+        return parent >= 0 ? layout.NodeIds[parent] : -1;
     }
 }
 
@@ -174,4 +368,14 @@ public readonly struct TweenedCell
 
     /// <summary>True when this node did not exist in the previous layout.</summary>
     public required bool IsEntering { get; init; }
+
+    /// <summary>
+    /// Index of this cell's parent within the same frame, or -1 for a frame root.
+    /// Always expressed in the frame's own draw order rather than in either
+    /// endpoint layout's, because cells move between parents mid-transition. This
+    /// is what lets the renderer walk the hover path to the root without guessing
+    /// from geometry: during a transition a child can sit outside the rectangle
+    /// its parent is animating towards.
+    /// </summary>
+    public required int ParentIndex { get; init; }
 }

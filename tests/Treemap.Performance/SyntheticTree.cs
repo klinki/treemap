@@ -21,7 +21,20 @@ namespace Treemap.Performance;
 /// </remarks>
 public static class SyntheticTree
 {
-    private static int _nextId;
+    /// <summary>
+    /// Id source scoped to a single <see cref="Build"/> call.
+    /// </summary>
+    /// <remarks>
+    /// Ids used to come from a static counter reset at the top of <c>Build</c>. Two
+    /// concurrent builds reset and advanced each other's counter, which produced
+    /// duplicate ids inside one tree and made the same seed produce different trees.
+    /// </remarks>
+    private sealed class Ids
+    {
+        private int _next;
+
+        public int Next() => _next++;
+    }
 
     /// <summary>Deterministic PRNG so benchmark runs are comparable across machines.</summary>
     private sealed class Rng(int seed)
@@ -47,7 +60,7 @@ public static class SyntheticTree
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(targetFileCount, 1);
 
-        _nextId = 0;
+        Ids ids = new();
         Rng rng = new(seed);
 
         List<TreemapNode> roots = [];
@@ -56,17 +69,17 @@ public static class SyntheticTree
         // Free space is always present on a real volume and is a large flat node,
         // which exercises the space-node colour path.
         roots.Add(TreemapNode.Create(
-            NextId(), "Unallocated", NodeKind.FreeSpace, 95_000_000_000L, 95_000_000_000L));
+            ids.Next(), "Unallocated", NodeKind.FreeSpace, 95_000_000_000L, 95_000_000_000L));
 
         while (budget > 0)
         {
-            roots.Add(BuildTopLevel(rng, ref budget));
+            roots.Add(BuildTopLevel(rng, ids, ref budget));
         }
 
-        return TreemapNode.Create(NextId(), "Local Disk (C:)", NodeKind.Drive, 0, 0, null, 0, roots);
+        return TreemapNode.Create(ids.Next(), "Local Disk (C:)", NodeKind.Drive, 0, 0, null, 0, roots);
     }
 
-    private static TreemapNode BuildTopLevel(Rng rng, ref int budget)
+    private static TreemapNode BuildTopLevel(Rng rng, Ids ids, ref int budget)
     {
         string[] names =
         [
@@ -80,14 +93,14 @@ public static class SyntheticTree
         share = Math.Min(share, budget);
 
         TreemapNode node = name == "Users"
-            ? BuildUsersProfile(rng, share, ref budget)
-            : BuildFolder(rng, name, share, ref budget, maxDepth: 3);
+            ? BuildUsersProfile(rng, ids, share, ref budget)
+            : BuildFolder(rng, ids, name, share, ref budget, maxDepth: 3);
 
         return node;
     }
 
     /// <summary>Users is the dominant branch on a real machine, and nests deepest.</summary>
-    private static TreemapNode BuildUsersProfile(Rng rng, int share, ref int budget)
+    private static TreemapNode BuildUsersProfile(Rng rng, Ids ids, int share, ref int budget)
     {
         List<TreemapNode> profiles = [];
 
@@ -102,14 +115,14 @@ public static class SyntheticTree
                 break;
             }
 
-            profiles.Add(BuildFolder(rng, user, userBudget, ref budget, maxDepth: 4, userProfile: true));
+            profiles.Add(BuildFolder(rng, ids, user, userBudget, ref budget, maxDepth: 4, userProfile: true));
         }
 
-        return TreemapNode.Create(NextId(), "Users", NodeKind.Folder, 0, 0, null, 0, profiles);
+        return TreemapNode.Create(ids.Next(), "Users", NodeKind.Folder, 0, 0, null, 0, profiles);
     }
 
     private static TreemapNode BuildFolder(
-        Rng rng, string name, int fileCount, ref int budget, int maxDepth, bool userProfile = false)
+        Rng rng, Ids ids, string name, int fileCount, ref int budget, int maxDepth, bool userProfile = false)
     {
         List<TreemapNode> children = [];
 
@@ -123,7 +136,7 @@ public static class SyntheticTree
         int direct = Math.Max(1, (int)(fileCount * (0.15 + (rng.NextDouble() * 0.35))));
         for (int i = 0; i < direct && budget > 0; i++)
         {
-            children.Add(MakeFile(rng));
+            children.Add(MakeFile(rng, ids));
             budget--;
         }
 
@@ -145,14 +158,14 @@ public static class SyntheticTree
                 }
 
                 children.Add(BuildFolder(
-                    rng, SubFolderName(rng), childShare, ref budget, maxDepth - 1, userProfile));
+                    rng, ids, SubFolderName(rng), childShare, ref budget, maxDepth - 1, userProfile));
             }
         }
 
-        return TreemapNode.Create(NextId(), name, NodeKind.Folder, 0, 0, null, 0, children);
+        return TreemapNode.Create(ids.Next(), name, NodeKind.Folder, 0, 0, null, 0, children);
     }
 
-    private static TreemapNode MakeFile(Rng rng)
+    private static TreemapNode MakeFile(Rng rng, Ids ids)
     {
         // Log-ish distribution: mostly small files with rare multi-hundred-MB outliers.
         double roll = rng.NextDouble();
@@ -165,7 +178,7 @@ public static class SyntheticTree
         };
 
         return TreemapNode.Create(
-            NextId(),
+            ids.Next(),
             FileName(rng),
             NodeKind.File,
             size,
@@ -173,8 +186,6 @@ public static class SyntheticTree
             DateTimeOffset.UnixEpoch.AddSeconds(rng.Next(0, 1_700_000_000)),
             rng.Next(0, 10));
     }
-
-    private static int NextId() => _nextId++;
 
     private static readonly string[] Extensions =
         [".dll", ".exe", ".cs", ".json", ".png", ".log", ".tmp", ".dat", ".txt", ".pak", ".bin"];

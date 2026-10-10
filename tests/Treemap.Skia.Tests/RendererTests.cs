@@ -312,4 +312,233 @@ public class RendererTests
 
         return seen.Count;
     }
+
+    // ---- hover ancestry ----
+
+    private static TweenedCell FrameCell(int id, RectF bounds, int depth, int parent)
+        => new()
+        {
+            NodeId = id,
+            Bounds = bounds,
+            Alpha = 1f,
+            Depth = depth,
+            Kind = NodeKind.Folder,
+            ColorGroup = 0,
+            AreaFraction = 1f,
+            HasChildren = true,
+            IsEntering = false,
+            ParentIndex = parent,
+        };
+
+    private static int IndexOfFrame(IReadOnlyList<TweenedCell> frame, int nodeId)
+    {
+        for (int i = 0; i < frame.Count; i++)
+        {
+            if (frame[i].NodeId == nodeId)
+            {
+                return i;
+            }
+        }
+
+        Assert.Fail($"node {nodeId} is not in the frame");
+        return -1;
+    }
+
+    private static int CountWhite(SKBitmap bitmap, in RectF region, in RectF exclude = default)
+    {
+        int count = 0;
+        int x0 = Math.Max(0, (int)MathF.Round(region.Left));
+        int y0 = Math.Max(0, (int)MathF.Round(region.Top));
+        int x1 = Math.Min(bitmap.Width, (int)MathF.Round(region.Right));
+        int y1 = Math.Min(bitmap.Height, (int)MathF.Round(region.Bottom));
+
+        for (int y = y0; y < y1; y++)
+        {
+            for (int x = x0; x < x1; x++)
+            {
+                if (exclude.Contains(x + 0.5f, y + 0.5f))
+                {
+                    continue;
+                }
+
+                if (bitmap.GetPixel(x, y) == SKColors.White)
+                {
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    private static SKBitmap RenderFrame(
+        TreemapRenderer renderer, IReadOnlyList<TweenedCell> frame, int hoveredNodeId, int size, bool shadow = false)
+    {
+        SKBitmap bitmap = new(size, size);
+        using SKCanvas canvas = new(bitmap);
+        canvas.Clear(SKColors.Black);
+
+        renderer.Draw(canvas, frame, new RenderState
+        {
+            HoveredNodeId = hoveredNodeId,
+            HighlightShadow = shadow,
+            ShowLabels = false,
+        });
+
+        return bitmap;
+    }
+
+    /// <summary>
+    /// A cell that geometrically contains the hovered one is not necessarily an
+    /// ancestor of it. Mid-transition, where a child has been reparented, it very
+    /// definitely is not — so containment must not drive the highlight.
+    /// </summary>
+    [Fact]
+    public void HoverOutlineSkipsAContainerThatIsNotAnAncestor()
+    {
+        RectF container = new(0, 0, 120, 120);
+        RectF child = new(40, 40, 40, 40);
+
+        // child sits inside container, but its parent index says it has none.
+        List<TweenedCell> frame =
+        [
+            FrameCell(1, container, depth: 0, parent: -1),
+            FrameCell(2, child, depth: 1, parent: -1),
+        ];
+
+        using TreemapRenderer renderer = new();
+        using SKBitmap hovered = RenderFrame(renderer, frame, hoveredNodeId: 2, size: 160);
+
+        Assert.True(CountWhite(hovered, child) > 0, "the hovered cell itself must be outlined");
+        Assert.Equal(0, CountWhite(hovered, container, child.Inset(-4f, -4f)));
+    }
+
+    /// <summary>
+    /// The complementary case: the declared ancestor is drawn where its bounds do
+    /// not contain the child at all, because the two are animating towards different
+    /// rectangles. The outline has to follow the relationship, not the geometry.
+    /// </summary>
+    [Fact]
+    public void HoverOutlineFollowsAnAncestorThatDoesNotContainTheChild()
+    {
+        RectF ancestor = new(10, 10, 100, 100);
+        RectF child = new(150, 20, 40, 40);
+
+        Assert.False(
+            ancestor.Left <= child.Left && ancestor.Top <= child.Top
+            && ancestor.Right >= child.Right && ancestor.Bottom >= child.Bottom,
+            "the fixture must place the child outside its ancestor");
+
+        List<TweenedCell> frame =
+        [
+            FrameCell(1, ancestor, depth: 0, parent: -1),
+            FrameCell(2, child, depth: 1, parent: 0),
+        ];
+
+        using TreemapRenderer renderer = new();
+        using SKBitmap plain = RenderFrame(renderer, frame, hoveredNodeId: -1, size: 200);
+        using SKBitmap hovered = RenderFrame(renderer, frame, hoveredNodeId: 2, size: 200);
+
+        Assert.Equal(0, CountWhite(plain, ancestor));
+        Assert.True(CountWhite(hovered, ancestor) > 0, "the declared ancestor must be outlined anyway");
+    }
+
+    /// <summary>
+    /// A cell that has faded out is not drawn, so a stale hover id must not leave a
+    /// floating outline and shadow over whatever replaced it.
+    /// </summary>
+    [Fact]
+    public void HoverOnACellThatHasFadedOutDrawsNothing()
+    {
+        RectF ghost = new(20, 20, 60, 60);
+        RectF replacement = new(0, 0, 100, 100);
+
+        List<TweenedCell> frame =
+        [
+            FrameCell(1, replacement, depth: 0, parent: -1),
+            new()
+            {
+                NodeId = 2,
+                Bounds = ghost,
+                Alpha = 0f,
+                Depth = 1,
+                Kind = NodeKind.File,
+                ColorGroup = 1,
+                AreaFraction = 0.1f,
+                HasChildren = false,
+                IsEntering = false,
+                ParentIndex = 0,
+            },
+        ];
+
+        using TreemapRenderer renderer = new();
+        using SKBitmap plain = RenderFrame(renderer, frame, hoveredNodeId: -1, size: 140, shadow: true);
+        using SKBitmap hovered = RenderFrame(renderer, frame, hoveredNodeId: 2, size: 140, shadow: true);
+
+        for (int y = 0; y < 140; y++)
+        {
+            for (int x = 0; x < 140; x++)
+            {
+                Assert.True(
+                    plain.GetPixel(x, y) == hovered.GetPixel(x, y),
+                    $"pixel ({x},{y}) changed for a cell that was not drawn");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The pixel consequence of draw order: at progress 0 the retained leaf is
+    /// painted after the departing folder that used to contain it, so it is the
+    /// leaf's colour on screen rather than the folder's.
+    /// </summary>
+    [Fact]
+    public void DepartingParentIsNotPaintedOverItsRetainedChild()
+    {
+        TreemapNode before = TreemapNode.Create(1, "root", NodeKind.Drive, 0, 0, null, 0,
+            [
+                TreemapNode.Create(2, "wrap", NodeKind.Folder, 0, 0, null, 0,
+                    [TreemapNode.Create(3, "leaf.bin", NodeKind.File, 500, 500, null, 3)]),
+            ]);
+
+        TreemapNode after = TreemapNode.Create(1, "root", NodeKind.Drive, 0, 0, null, 0,
+            [TreemapNode.Create(3, "leaf.bin", NodeKind.File, 500, 500, null, 3)]);
+
+        RectF bounds = new(0, 0, 120, 120);
+        LayoutOptions options = new() { InnerPadding = 1f };
+
+        LayoutTween tween = new(
+            SquarifyLayout.Compute(before, bounds, options),
+            SquarifyLayout.Compute(after, bounds, options));
+
+        List<TweenedCell> frame = [];
+        tween.Evaluate(0f, frame);
+
+        int departing = IndexOfFrame(frame, 2);
+        int leaf = IndexOfFrame(frame, 3);
+        Assert.True(departing < leaf, "the departing folder must be painted first");
+
+        using SKBitmap bitmap = new(120, 120);
+        using SKCanvas canvas = new(bitmap);
+        canvas.Clear(SKColors.Black);
+
+        using TreemapRenderer renderer = new();
+        renderer.Draw(canvas, frame, new RenderState { ShowLabels = false });
+
+        RectF leafBounds = frame[leaf].Bounds;
+        int cx = (int)(leafBounds.X + (leafBounds.Width / 2f));
+        int cy = (int)(leafBounds.Y + (leafBounds.Height / 2f));
+
+        TreemapPalette palette = TreemapPalette.Default;
+
+        SKColor leafColour = palette.Resolve(
+            frame[leaf].Kind, frame[leaf].ColorGroup, frame[leaf].Depth, frame[leaf].Alpha);
+
+        SKColor folderColour = palette.Resolve(
+            frame[departing].Kind, frame[departing].ColorGroup, frame[departing].Depth, frame[departing].Alpha);
+
+        // The two are genuinely different, so the assertion below can only pass if
+        // the leaf was painted on top rather than hidden behind its old parent.
+        Assert.NotEqual(leafColour, folderColour);
+        Assert.Equal(leafColour, bitmap.GetPixel(cx, cy));
+    }
 }

@@ -27,7 +27,7 @@ public enum NodeKind
 /// </summary>
 public sealed class TreemapNode
 {
-    private static readonly IReadOnlyList<TreemapNode> NoChildren = Array.Empty<TreemapNode>();
+    private static readonly IReadOnlyList<TreemapNode> NoChildren = Array.AsReadOnly(Array.Empty<TreemapNode>());
 
     public int Id { get; }
 
@@ -76,6 +76,12 @@ public sealed class TreemapNode
     /// are omitted for a node with children, they are computed by summing descendants,
     /// so a partially-built tree can never silently render as zero-area.
     /// </summary>
+    /// <remarks>
+    /// The caller's child collection is copied. Nodes are treated as immutable the
+    /// moment they are built, and a published snapshot is walked from the render thread
+    /// without any lock — sharing a mutable backing list or array would reintroduce the
+    /// exact race the snapshot design exists to remove.
+    /// </remarks>
     public static TreemapNode Create(
         int id,
         string name,
@@ -86,7 +92,7 @@ public sealed class TreemapNode
         int colorGroup = 0,
         IReadOnlyList<TreemapNode>? children = null)
     {
-        IReadOnlyList<TreemapNode> kids = children ?? NoChildren;
+        IReadOnlyList<TreemapNode> kids = Freeze(children);
 
         if (kids.Count > 0 && logicalSize == 0 && physicalSize == 0)
         {
@@ -94,7 +100,8 @@ public sealed class TreemapNode
             long childPhysical = 0;
             foreach (TreemapNode child in kids)
             {
-                childLogical += child.LayoutSize;
+                // Logical bytes and allocated bytes are separate totals.
+                childLogical += child.LogicalSize;
                 childPhysical += child.PhysicalSize;
             }
 
@@ -103,6 +110,26 @@ public sealed class TreemapNode
         }
 
         return new TreemapNode(id, name, kind, logicalSize, physicalSize, lastWriteTime, colorGroup, kids);
+    }
+
+    /// <summary>
+    /// Copies <paramref name="children"/> into a read-only wrapper so neither the
+    /// caller's collection nor the copy's backing array is reachable from the node.
+    /// </summary>
+    private static IReadOnlyList<TreemapNode> Freeze(IReadOnlyList<TreemapNode>? children)
+    {
+        if (children is null || children.Count == 0)
+        {
+            return NoChildren;
+        }
+
+        TreemapNode[] copy = new TreemapNode[children.Count];
+        for (int i = 0; i < copy.Length; i++)
+        {
+            copy[i] = children[i];
+        }
+
+        return Array.AsReadOnly(copy);
     }
 
     /// <summary>
@@ -116,59 +143,58 @@ public sealed class TreemapNode
     /// Optional overrides replace the computed values (used for free/unknown space,
     /// which is reported by the volume rather than by any child).
     /// </summary>
+    /// <remarks>
+    /// Each node is aggregated exactly once and an unchanged subtree is returned as the
+    /// same instance, so cost is linear in tree size and callers holding an older node
+    /// reference still see reference equality when nothing moved.
+    /// </remarks>
     public static TreemapNode WithAggregatedSizes(
         TreemapNode node,
         long? logicalSizeOverride = null,
         long? physicalSizeOverride = null)
     {
-        long logical;
-        long physical;
+        int childCount = node.Children.Count;
 
-        if (node.Children.Count == 0)
+        // Non-null only when at least one child instance was replaced. Wrapped, never a
+        // bare array: the rebuilt list is handed to a node and must stay unmodifiable.
+        IReadOnlyList<TreemapNode>? rebuiltChildren = null;
+        long childLogical = 0;
+        long childPhysical = 0;
+
+        if (childCount > 0)
         {
-            logical = logicalSizeOverride ?? node.LogicalSize;
-            physical = physicalSizeOverride ?? node.PhysicalSize;
-        }
-        else
-        {
-            long childLogical = 0;
-            long childPhysical = 0;
-            foreach (TreemapNode child in node.Children)
+            TreemapNode[] rebuilt = new TreemapNode[childCount];
+            bool anyChildChanged = false;
+
+            for (int i = 0; i < childCount; i++)
             {
+                TreemapNode child = node.Children[i];
                 TreemapNode aggregated = WithAggregatedSizes(child);
+
+                rebuilt[i] = aggregated;
                 childLogical += aggregated.LogicalSize;
                 childPhysical += aggregated.PhysicalSize;
+                anyChildChanged |= !ReferenceEquals(child, aggregated);
             }
 
-            logical = logicalSizeOverride ?? childLogical;
-            physical = physicalSizeOverride ?? childPhysical;
+            if (anyChildChanged)
+            {
+                rebuiltChildren = Array.AsReadOnly(rebuilt);
+            }
         }
 
-        if (logical == node.LogicalSize && physical == node.PhysicalSize && ChildrenSame(node))
+        long logical = logicalSizeOverride ?? (childCount > 0 ? childLogical : node.LogicalSize);
+        long physical = physicalSizeOverride ?? (childCount > 0 ? childPhysical : node.PhysicalSize);
+
+        if (rebuiltChildren is null && logical == node.LogicalSize && physical == node.PhysicalSize)
         {
             return node;
         }
 
-        TreemapNode[] rebuilt;
-        if (node.Children.Count == 0)
-        {
-            rebuilt = NoChildren.ToArray();
-        }
-        else
-        {
-            rebuilt = new TreemapNode[node.Children.Count];
-            for (int i = 0; i < node.Children.Count; i++)
-            {
-                rebuilt[i] = WithAggregatedSizes(node.Children[i]);
-            }
-        }
-
         return new TreemapNode(
             node.Id, node.Name, node.Kind, logical, physical,
-            node.LastWriteTime, node.ColorGroup, rebuilt);
+            node.LastWriteTime, node.ColorGroup, rebuiltChildren ?? node.Children);
     }
-
-    private static bool ChildrenSame(TreemapNode node) => node.Children.Count == 0;
 
     public override string ToString() => $"{Kind} '{Name}' ({LayoutSize} bytes)";
 }

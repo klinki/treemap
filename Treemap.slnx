@@ -6,6 +6,9 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Treemap.Core.Tests/Treemap.Core.Tests.csproj" />
+    <Project Path="tests/Treemap.Host.WinForms.Tests/Treemap.Host.WinForms.Tests.csproj" />
+    <Project Path="tests/Treemap.Perf.Tests/Treemap.Perf.Tests.csproj" />
+    <Project Path="tests/Treemap.Performance/Treemap.Performance.csproj" />
     <Project Path="tests/Treemap.Skia.Tests/Treemap.Skia.Tests.csproj" />
   </Folder>
   <Folder Name="/demo/">

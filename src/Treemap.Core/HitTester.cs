@@ -8,9 +8,21 @@ namespace Treemap;
 /// order), so the deepest hit is found by scanning backwards and returning the
 /// first match.
 /// </para>
+///
+/// <para>
+/// The frame overloads exist for the same reason: a tweened frame is what is on
+/// screen, and it has its own draw order, so pointer input must be resolved
+/// against it rather than against the layout the transition is heading for.
+/// </para>
 /// </summary>
 public static class HitTester
 {
+    /// <summary>
+    /// Alpha at or below which a cell counts as not drawn. Matches the renderer's
+    /// fill cutoff, so hover never lands on something the user cannot see.
+    /// </summary>
+    private const float VisibleAlpha = 0.01f;
+
     /// <summary>
     /// Returns the index of the deepest cell containing the point, or -1 if none.
     /// </summary>
@@ -72,6 +84,89 @@ public static class HitTester
         {
             path.Add(current);
             current = layout.ParentIndices[current];
+        }
+
+        return path;
+    }
+
+    /// <summary>
+    /// Frame-space counterpart of <see cref="HitTest"/>: the index of the deepest
+    /// visible cell under the point, or -1.
+    /// </summary>
+    public static int HitTestFrame(IReadOnlyList<TweenedCell> frame, float x, float y)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+
+        for (int i = frame.Count - 1; i >= 0; i--)
+        {
+            TweenedCell cell = frame[i];
+            if (cell.Alpha <= VisibleAlpha)
+            {
+                continue;
+            }
+
+            if (cell.Bounds.Contains(x, y))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Frame-space counterpart of <see cref="HitTestContent"/>: the deepest visible
+    /// node id under the point, skipping space cells and cells that have faded out.
+    /// </summary>
+    public static int HitTestFrameContent(IReadOnlyList<TweenedCell> frame, float x, float y)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+
+        for (int i = frame.Count - 1; i >= 0; i--)
+        {
+            TweenedCell cell = frame[i];
+            if (cell.Alpha <= VisibleAlpha)
+            {
+                continue;
+            }
+
+            if (!cell.Bounds.Contains(x, y))
+            {
+                continue;
+            }
+
+            if (cell.Kind is NodeKind.FreeSpace or NodeKind.UnknownSpace or NodeKind.MissingData)
+            {
+                // Same reasoning as the layout path: a space cell has no children, so
+                // this is a miss, and anything meaningful was drawn before it.
+                continue;
+            }
+
+            return cell.NodeId;
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Frame-space counterpart of <see cref="PathToRoot"/>: the cell and its
+    /// ancestors, nearest parent first.
+    /// </summary>
+    public static List<int> FramePathToRoot(IReadOnlyList<TweenedCell> frame, int cellIndex, List<int>? reuse = null)
+    {
+        List<int> path = reuse ?? [];
+        path.Clear();
+
+        if (cellIndex < 0 || cellIndex >= frame.Count)
+        {
+            return path;
+        }
+
+        int current = cellIndex;
+        while (current >= 0)
+        {
+            path.Add(current);
+            current = frame[current].ParentIndex;
         }
 
         return path;

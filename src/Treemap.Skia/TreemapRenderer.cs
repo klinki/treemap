@@ -44,6 +44,11 @@ public sealed class TreemapRenderer : IDisposable
     private readonly SKPaint _shadowPaint = new() { Style = SKPaintStyle.Fill, IsAntialias = true, Color = new SKColor(0, 0, 0, 0x66) };
     private readonly SKPaint _textPaint = new() { Style = SKPaintStyle.Fill, IsAntialias = true };
 
+    // Scratch buffers reused between frames, so the settled and hover paths do not
+    // allocate per draw.
+    private readonly List<TweenedCell> _settledFrame = [];
+    private readonly List<int> _hoverPath = [];
+
     private SKTypeface? _typeface;
     private SKFont _font = new();
 
@@ -54,8 +59,8 @@ public sealed class TreemapRenderer : IDisposable
     }
 
     /// <summary>
-    /// Renders a frame of tweened cells. Cells are expected in draw order
-    /// (shallow to deep), which <see cref="LayoutTween"/> guarantees.
+    /// Renders a frame of tweened cells. Cells are expected in draw order (parents
+    /// before children), which <see cref="LayoutTween"/> prepares once per tween.
     /// </summary>
     public void Draw(SKCanvas canvas, IReadOnlyList<TweenedCell> frame, RenderState state)
     {
@@ -63,12 +68,24 @@ public sealed class TreemapRenderer : IDisposable
         ArgumentNullException.ThrowIfNull(frame);
         ArgumentNullException.ThrowIfNull(state);
 
-        // Pass 1: fills, back to front so nested children cover their parent.
-        foreach (TweenedCell cell in frame)
+        // Pass 1: fills, back to front so nested children cover their parent. The
+        // hovered cell's index is picked up here, so neither the shadow nor the
+        // outline needs its own scan of the frame. Only cells that are actually
+        // drawn qualify: a cell that has faded out would otherwise get a phantom
+        // shadow and outline drawn over whatever replaced it.
+        int hoveredIndex = -1;
+
+        for (int i = 0; i < frame.Count; i++)
         {
+            TweenedCell cell = frame[i];
             if (cell.Alpha <= 0.01f)
             {
                 continue;
+            }
+
+            if (cell.NodeId == state.HoveredNodeId)
+            {
+                hoveredIndex = i;
             }
 
             _fillPaint.Color = _palette.Resolve(cell.Kind, cell.ColorGroup, cell.Depth, cell.Alpha);
@@ -77,24 +94,24 @@ public sealed class TreemapRenderer : IDisposable
 
         // Pass 2: shadow under the highlighted element, then borders, then the
         // ancestor outline. Shadow first so borders sit crisply on top.
-        if (state.HighlightShadow && state.HoveredNodeId >= 0)
+        if (hoveredIndex >= 0 && state.HighlightShadow)
         {
-            DrawShadow(canvas, frame, state.HoveredNodeId);
+            DrawShadow(canvas, frame[hoveredIndex].Bounds);
         }
 
-        foreach (TweenedCell cell in frame)
+        for (int i = 0; i < frame.Count; i++)
         {
-            if (cell.Alpha <= 0.01f)
+            if (frame[i].Alpha <= 0.01f)
             {
                 continue;
             }
 
-            canvas.DrawRect(ToSkia(cell.Bounds), _borderPaint);
+            canvas.DrawRect(ToSkia(frame[i].Bounds), _borderPaint);
         }
 
-        if (state.HoveredNodeId >= 0)
+        if (hoveredIndex >= 0)
         {
-            DrawHoverOutline(canvas, frame, state.HoveredNodeId);
+            DrawHoverOutline(canvas, frame, hoveredIndex);
         }
 
         // Pass 3: labels last so they sit above every fill.
@@ -109,10 +126,26 @@ public sealed class TreemapRenderer : IDisposable
     {
         ArgumentNullException.ThrowIfNull(layout);
 
-        List<TweenedCell> frame = new(layout.Count);
+        Draw(canvas, SettledFrame(layout), state);
+    }
+
+    /// <summary>
+    /// Projects a layout into a frame. The list is reused, but it is repopulated on
+    /// every call: <see cref="LayoutResult"/> exposes its arrays as public mutable
+    /// fields, so a layout is not actually immutable and a cached projection could
+    /// outlive an edit to it and draw stale geometry.
+    /// </summary>
+    private IReadOnlyList<TweenedCell> SettledFrame(LayoutResult layout)
+    {
+        _settledFrame.Clear();
+        if (_settledFrame.Capacity < layout.Count)
+        {
+            _settledFrame.Capacity = layout.Count;
+        }
+
         for (int i = 0; i < layout.Count; i++)
         {
-            frame.Add(new TweenedCell
+            _settledFrame.Add(new TweenedCell
             {
                 NodeId = layout.NodeIds[i],
                 Bounds = layout.Bounds[i],
@@ -123,45 +156,41 @@ public sealed class TreemapRenderer : IDisposable
                 AreaFraction = layout.AreaFractions[i],
                 HasChildren = layout.HasChildren[i],
                 IsEntering = false,
+                ParentIndex = layout.ParentIndices[i],
             });
         }
 
-        Draw(canvas, frame, state);
+        return _settledFrame;
     }
 
     /// <summary>
-    /// Outlines the hovered cell's ancestors. Uses geometric containment because a tweened
-    /// frame carries no parent links.
+    /// Outlines the hovered cell and its ancestors. Ancestry comes from each cell's
+    /// explicit <see cref="TweenedCell.ParentIndex"/> rather than geometric containment: a
+    /// tweened child can sit well outside the rectangle its parent is animating
+    /// towards, and containment would silently drop the highlight exactly when a
+    /// tree is being restructured.
     /// </summary>
-    private void DrawHoverOutline(SKCanvas canvas, IReadOnlyList<TweenedCell> frame, int nodeId)
+    private void DrawHoverOutline(SKCanvas canvas, IReadOnlyList<TweenedCell> frame, int hoveredIndex)
     {
-        RectF hovered = FindBounds(frame, nodeId);
+        RectF hovered = frame[hoveredIndex].Bounds;
         if (hovered.IsEmpty)
         {
             return;
         }
 
-        int hoveredDepth = FindDepth(frame, nodeId);
+        List<int> path = HitTester.FramePathToRoot(frame, hoveredIndex, _hoverPath);
 
-        foreach (TweenedCell cell in frame)
+        // Outermost first, then the hovered cell, so nested outlines layer correctly.
+        for (int i = path.Count - 1; i >= 1; i--)
         {
-            if (cell.NodeId == nodeId || cell.Depth >= hoveredDepth)
-            {
-                continue;
-            }
-
-            if (Contains(cell.Bounds, hovered))
-            {
-                canvas.DrawRect(ToSkia(cell.Bounds), _highlightPaint);
-            }
+            canvas.DrawRect(ToSkia(frame[path[i]].Bounds), _highlightPaint);
         }
 
         canvas.DrawRect(ToSkia(hovered), _highlightPaint);
     }
 
-    private void DrawShadow(SKCanvas canvas, IReadOnlyList<TweenedCell> frame, int nodeId)
+    private void DrawShadow(SKCanvas canvas, in RectF bounds)
     {
-        RectF bounds = FindBounds(frame, nodeId);
         if (bounds.IsEmpty)
         {
             return;
@@ -280,36 +309,6 @@ public sealed class TreemapRenderer : IDisposable
 
     private string NameFor(TweenedCell cell)
         => NameResolver?.Invoke(cell.NodeId) ?? cell.NodeId.ToString();
-
-    private static RectF FindBounds(IReadOnlyList<TweenedCell> frame, int nodeId)
-    {
-        foreach (TweenedCell cell in frame)
-        {
-            if (cell.NodeId == nodeId)
-            {
-                return cell.Bounds;
-            }
-        }
-
-        return RectF.Empty;
-    }
-
-    private static int FindDepth(IReadOnlyList<TweenedCell> frame, int nodeId)
-    {
-        foreach (TweenedCell cell in frame)
-        {
-            if (cell.NodeId == nodeId)
-            {
-                return cell.Depth;
-            }
-        }
-
-        return -1;
-    }
-
-    private static bool Contains(in RectF outer, in RectF inner)
-        => outer.Left <= inner.Left && outer.Top <= inner.Top
-        && outer.Right >= inner.Right && outer.Bottom >= inner.Bottom;
 
     private static SKRect ToSkia(in RectF r) => new(r.Left, r.Top, r.Right, r.Bottom);
 

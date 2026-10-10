@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Treemap;
 using Xunit;
 
@@ -34,6 +35,131 @@ public class SnapshotTests
             Assert.True(s.Version > previous);
             previous = s.Version;
         }
+    }
+
+    /// <summary>
+    /// A subscriber is notified on the publishing thread, and by then the new snapshot is
+    /// already what <see cref="SnapshotPublisher.Current"/> returns.
+    /// </summary>
+    [Fact]
+    public void PublishNotifiesAfterTheSnapshotIsVisible()
+    {
+        SnapshotPublisher publisher = new(TreeBuilder.Folder(0, "empty"));
+
+        List<TreemapSnapshot> seen = [];
+        publisher.Published += () => seen.Add(publisher.Current);
+
+        TreemapSnapshot published = publisher.Publish(TreeBuilder.Folder(1, "root", TreeBuilder.File(2, "a", 100)));
+
+        Assert.Single(seen);
+        Assert.Same(published, seen[0]);
+    }
+
+    /// <summary>
+    /// The notification runs after the writer lock is released, so a subscriber may
+    /// publish again instead of deadlocking against the publisher that woke it.
+    /// </summary>
+    [Fact]
+    public void SubscriberMayPublishAgainWithoutDeadlocking()
+    {
+        SnapshotPublisher publisher = new(TreeBuilder.Folder(0, "empty"));
+
+        int notifications = 0;
+        TreemapSnapshot? nested = null;
+
+        publisher.Published += () =>
+        {
+            if (Interlocked.Increment(ref notifications) > 1)
+            {
+                return;
+            }
+
+            nested = publisher.Publish(TreeBuilder.Folder(1, "nested"));
+        };
+
+        TreemapSnapshot outer = publisher.Publish(TreeBuilder.Folder(1, "outer"));
+
+        Assert.NotNull(nested);
+        Assert.Equal(2, notifications);
+        Assert.Same(nested, publisher.Current);
+        Assert.Equal(1L, outer.Version);
+        Assert.Equal(2L, publisher.Current.Version);
+    }
+
+    /// <summary>
+    /// A slow subscriber must not hold the writer lock: readers stay lock-free and another
+    /// publisher keeps making progress while the notification is still running.
+    /// </summary>
+    [Fact]
+    public void ReadersAndOtherPublishersProgressWhileANotificationIsInFlight()
+    {
+        SnapshotPublisher publisher = new(TreeBuilder.Folder(0, "empty"));
+
+        using ManualResetEventSlim insideNotification = new();
+        using ManualResetEventSlim releaseNotification = new();
+        long reads = 0;
+        bool stop = false;
+        Exception? failure = null;
+
+        int notifications = 0;
+        publisher.Published += () =>
+        {
+            if (Interlocked.Increment(ref notifications) == 1)
+            {
+                insideNotification.Set();
+                if (!releaseNotification.Wait(TimeSpan.FromSeconds(10)))
+                {
+                    throw new TimeoutException();
+                }
+            }
+        };
+
+        Thread reader = new(() =>
+        {
+            try
+            {
+                while (!Volatile.Read(ref stop))
+                {
+                    _ = publisher.Current.Root;
+                    Interlocked.Increment(ref reads);
+                }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref failure, ex);
+            }
+        })
+        {
+            IsBackground = true,
+        };
+
+        Thread first = new(() => publisher.Publish(TreeBuilder.Folder(1, "first")))
+        {
+            IsBackground = true,
+        };
+
+        reader.Start();
+        first.Start();
+        Assert.True(insideNotification.Wait(TimeSpan.FromSeconds(10)), "the subscriber was never called");
+
+        // The subscriber is now parked inside the notification, with no lock held.
+        Thread second = new(() => publisher.Publish(TreeBuilder.Folder(1, "second")))
+        {
+            IsBackground = true,
+        };
+
+        second.Start();
+        Assert.True(second.Join(TimeSpan.FromSeconds(10)), "a second publisher blocked behind the notification");
+        Assert.True(Volatile.Read(ref reads) > 0, "readers stalled while a notification was in flight");
+
+        releaseNotification.Set();
+
+        Assert.True(first.Join(TimeSpan.FromSeconds(10)), "the first publisher never returned");
+        Volatile.Write(ref stop, true);
+        Assert.True(reader.Join(TimeSpan.FromSeconds(10)), "the reader never stopped");
+
+        Assert.Null(failure);
+        Assert.Equal(2L, publisher.Current.Version);
     }
 
     /// <summary>
@@ -124,6 +250,124 @@ public class SnapshotTests
         Assert.Null(failure);
         Assert.True(writes > 0, "writer should have published at least once");
         Assert.True(reads > 0, "readers should have observed snapshots");
+    }
+
+    [Fact]
+    public void PublishedSnapshotSurvivesLaterMutationOfTheSourceCollection()
+    {
+        List<TreemapNode> staging = new() { TreeBuilder.File(2, "a", 100) };
+        TreemapNode root = TreemapNode.Create(1, "root", NodeKind.Drive, 0, 0, null, 0, staging);
+
+        SnapshotPublisher publisher = new(TreeBuilder.Folder(0, "empty"));
+        TreemapSnapshot published = publisher.Publish(root);
+
+        // The scanner keeps filling its staging list after publishing.
+        staging.Add(TreeBuilder.File(3, "b", 7));
+        staging.Clear();
+
+        Assert.Equal(2, published.NodeCount);
+        Assert.True(published.TryGetNode(2, out TreemapNode kept));
+        Assert.Equal("a", kept.Name);
+        Assert.False(published.TryGetNode(3, out _));
+        Assert.Equal(100, published.Root.LogicalSize);
+    }
+
+    /// <summary>
+    /// Several publishers may race. Because the version is allocated and the reference
+    /// published under one lock, no reader can ever see the current snapshot go
+    /// backwards, and no version number is handed out twice or lost.
+    /// </summary>
+    [Fact]
+    public void ConcurrentPublishersNeverRegressTheObservedVersion()
+    {
+        SnapshotPublisher publisher = new(TreeBuilder.Folder(0, "empty"));
+
+        const int WriterCount = 4;
+        const int PublishesPerWriter = 250;
+        int expectedTotal = WriterCount * PublishesPerWriter;
+
+        ConcurrentDictionary<long, byte> issuedVersions = new();
+        Exception? failure = null;
+        long reads = 0;
+        bool stop = false;
+
+        Thread reader = new(() =>
+        {
+            try
+            {
+                long highest = 0;
+                while (!Volatile.Read(ref stop))
+                {
+                    TreemapSnapshot snapshot = publisher.Current;
+                    long version = snapshot.Version;
+
+                    if (version < highest)
+                    {
+                        throw new InvalidOperationException(
+                            $"published version went backwards: saw {highest}, then {version}");
+                    }
+
+                    highest = version;
+                    Interlocked.Increment(ref reads);
+                    Thread.Yield();
+                }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref failure, ex);
+            }
+        })
+        {
+            IsBackground = true,
+        };
+
+        Thread[] writers = new Thread[WriterCount];
+        for (int w = 0; w < WriterCount; w++)
+        {
+            int writerId = w;
+            writers[w] = new Thread(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < PublishesPerWriter; i++)
+                    {
+                        TreemapNode root = TreeBuilder.Folder(
+                            1, $"root-{writerId}-{i}", TreeBuilder.File(1000 + i, "f", (i + 1) * 10L));
+
+                        issuedVersions.TryAdd(publisher.Publish(root).Version, 0);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.Exchange(ref failure, ex);
+                }
+            })
+            {
+                IsBackground = true,
+            };
+        }
+
+        reader.Start();
+        foreach (Thread writer in writers)
+        {
+            writer.Start();
+        }
+
+        foreach (Thread writer in writers)
+        {
+            Assert.True(writer.Join(TimeSpan.FromSeconds(30)), "writer did not finish");
+        }
+
+        Volatile.Write(ref stop, true);
+        Assert.True(reader.Join(TimeSpan.FromSeconds(30)), "reader did not finish");
+
+        Assert.Null(failure);
+        Assert.True(reads > 0, "reader should have observed snapshots");
+
+        // Every publish got its own version and none was dropped.
+        Assert.Equal(expectedTotal, issuedVersions.Count);
+        Assert.Equal((long)expectedTotal, publisher.Current.Version);
+        Assert.Equal((long)expectedTotal + 1, publisher.Publish(TreeBuilder.Folder(1, "final")).Version);
     }
 
     [Fact]
