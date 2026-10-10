@@ -1,0 +1,45 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.user
+*.suo
+*.userprefs
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# BenchmarkDotNet output
+BenchmarkDotNet.Artifacts/
+
+# Test output
+TestResults/
+*.trx
+*.coverage
+coverage*.xml
+coverage*.json
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.sln.docstates
+*.DotSettings.user
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp files
+*.bak
+*.tmp
+*.orig
+*.rej
+*~
+
+# Large generated assets
+*.png.zip

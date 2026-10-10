@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Treemap.Performance</RootNamespace>
+    <!--
+      BenchmarkDotNet locates the benchmark assembly by matching the output exe name
+      to the .csproj name. These MUST stay in sync or BDN fails with
+      "Unable to find <name> in ... and its subfolders".
+    -->
+    <AssemblyName>Treemap.Performance</AssemblyName>
+    <!-- BenchmarkDotNet requires optimisation and no debugger interference. -->
+    <Optimize Condition="'$(Configuration)' == 'Release'">true</Optimize>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- BDN warns about tiered PGO on some setups; keep the run deterministic. -->
+    <TieredPGO>false</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+    <PackageReference Include="BenchmarkDotNet.Diagnostics.Windows" Version="0.15.8" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" Version="4.153.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Treemap.Core\Treemap.Core.csproj" />
+    <ProjectReference Include="..\..\src\Treemap.Skia\Treemap.Skia.csproj" />
+  </ItemGroup>
+
+</Project>
