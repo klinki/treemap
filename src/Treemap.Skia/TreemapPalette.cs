@@ -39,9 +39,11 @@ public sealed class TreemapPalette
         _groupColors = groupColors ?? DefaultGroupColors();
         _folderColor = folderColor ?? new SKColor(0x8E, 0x9A, 0xAF);
         _driveColor = driveColor ?? new SKColor(0x6E, 0x7C, 0x91);
-        _freeSpaceColor = freeSpaceColor ?? new SKColor(0x4A, 0x4A, 0x4A);
-        _unknownSpaceColor = unknownSpaceColor ?? new SKColor(0x3A, 0x3A, 0x3A);
-        _missingDataColor = missingDataColor ?? new SKColor(0x8A, 0x4B, 0x4B);
+
+        // Reference recording: free space is a green block, unaccounted space gray.
+        _freeSpaceColor = freeSpaceColor ?? new SKColor(0x2E, 0x9E, 0x4B);
+        _unknownSpaceColor = unknownSpaceColor ?? new SKColor(0x70, 0x70, 0x70);
+        _missingDataColor = missingDataColor ?? new SKColor(0x5F, 0x5F, 0x5F);
     }
 
     public static TreemapPalette Default { get; } = new();

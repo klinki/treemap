@@ -109,4 +109,11 @@ internal sealed class ScanIdMap
     /// runs on - so it can never collide with a real directory entry.
     /// </summary>
     public int ReserveFreeSpace(string rootPath) => Reserve(rootPath + "\0#free-space");
+
+    /// <summary>
+    /// Id for the synthetic unaccounted-space block, keyed like
+    /// <see cref="ReserveFreeSpace(string)"/> under its own suffix so the two blocks never
+    /// share an id with each other or with a real entry.
+    /// </summary>
+    public int ReserveUnknownSpace(string rootPath) => Reserve(rootPath + "\0#unknown-space");
 }

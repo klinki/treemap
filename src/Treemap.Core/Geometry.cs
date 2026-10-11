@@ -94,3 +94,33 @@ public readonly struct PointF(float x, float y) : IEquatable<PointF>
     public override string ToString()
         => string.Create(CultureInfo.InvariantCulture, $"({X:0.##}, {Y:0.##})");
 }
+
+/// <summary>
+/// Human-readable byte sizes shared by header labels, leaf labels and tooltips,
+/// so every surface formats the same value the same way.
+/// </summary>
+public static class SizeFormat
+{
+    public static string FormatBytes(long bytes)
+    {
+        if (bytes < 0)
+        {
+            bytes = 0;
+        }
+
+        const long Kb = 1024;
+        const long Mb = 1024 * Kb;
+        const long Gb = 1024 * Mb;
+        const long Tb = 1024 * Gb;
+
+        return bytes >= Tb ? $"{bytes / (double)Tb:F1} TB"
+            : bytes >= Gb ? $"{bytes / (double)Gb:F1} GB"
+            : bytes >= Mb ? $"{bytes / (double)Mb:F1} MB"
+            : bytes >= Kb ? $"{bytes / (double)Kb:F0} KB"
+            : $"{bytes} B";
+    }
+
+    /// <summary>The size layout accounts: allocated when known, otherwise apparent.</summary>
+    public static long DisplaySize(long logicalSize, long physicalSize)
+        => physicalSize > 0 ? physicalSize : logicalSize;
+}

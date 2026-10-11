@@ -31,10 +31,20 @@ public enum ChangeKind
 /// </remarks>
 public sealed class TreemapController
 {
+    /// <summary>Shallowest visible descendant depth the detail controls allow.</summary>
+    public const int MinDetailDepth = 1;
+
+    /// <summary>Deepest visible descendant depth the detail controls allow.</summary>
+    public const int MaxDetailDepth = 64;
+
+    /// <summary>Bound on retained navigation entries, so previews cannot grow history without limit.</summary>
+    private const int MaxHistoryEntries = 100;
+
     private readonly SnapshotPublisher _publisher;
     private readonly TreemapCamera _camera = new();
     private readonly TreemapAnimator _animator;
-    private readonly List<NavigationEntry> _history = [];
+    private readonly List<NavigationEntry> _backStack = [];
+    private readonly List<NavigationEntry> _forwardStack = [];
 
     private LayoutResult _layout = LayoutResult.Empty;
     private RectF _viewport;
@@ -42,7 +52,12 @@ public sealed class TreemapController
     private int _hoveredNodeId = -1;
     private int _selectedNodeId = -1;
     private int _focusRootNodeId = -1;
+    private string? _focusSource;
     private ChangeKind _pending = ChangeKind.All;
+
+    private int _tooltipNodeId = -1;
+    private long _tooltipVersion = -1;
+    private string? _tooltipText;
 
     public TreemapController(
         SnapshotPublisher publisher, LayoutOptions? options = null, TimeProvider? timeProvider = null)
@@ -53,6 +68,7 @@ public sealed class TreemapController
         _options = options ?? LayoutOptions.Default;
         _animator = new TreemapAnimator(timeProvider: timeProvider);
         _focusRootNodeId = publisher.Current.Root.Id;
+        _focusSource = publisher.Current.RootPath;
         _camera.FitToContent(ContentBounds, _viewport);
     }
 
@@ -73,6 +89,58 @@ public sealed class TreemapController
     public int HoveredNodeId => _hoveredNodeId;
 
     public int SelectedNodeId => _selectedNodeId;
+
+    /// <summary>Node id the current layout is rooted at. Drilling changes it.</summary>
+    public int FocusRootNodeId => _focusRootNodeId;
+
+    /// <summary>Current layout options. Detail depth and space filters live here.</summary>
+    public LayoutOptions Options => _options;
+
+    /// <summary>Visible descendant depth, carried by <see cref="LayoutOptions.MaxDepth"/>.</summary>
+    public int DetailDepth => _options.MaxDepth;
+
+    public bool CanIncreaseDetail => _options.MaxDepth < MaxDetailDepth;
+
+    public bool CanDecreaseDetail => _options.MaxDepth > MinDetailDepth;
+
+    /// <summary>Whether the free-space block takes part in layout. The snapshot is untouched.</summary>
+    public bool ShowFreeSpace => _options.ShowFreeSpace;
+
+    /// <summary>Whether the unaccounted-space block takes part in layout. The snapshot is untouched.</summary>
+    public bool ShowUnknownSpace => _options.ShowUnknownSpace;
+
+    public bool CanGoBack => _backStack.Count > 0;
+
+    public bool CanGoForward => _forwardStack.Count > 0;
+
+    public bool CanGoHome
+    {
+        get
+        {
+            if (_forwardStack.Count > 0)
+            {
+                return true;
+            }
+
+            if (_focusRootNodeId != _publisher.Current.Root.Id)
+            {
+                return true;
+            }
+
+            return IsCameraOffFit();
+        }
+    }
+
+    /// <summary>Whether the focused node has a true parent in the whole snapshot.</summary>
+    public bool CanGoUp
+    {
+        get
+        {
+            TreemapSnapshot snapshot = _publisher.Current;
+            return snapshot.TryGetNode(_focusRootNodeId, out _)
+                && snapshot.TryGetParent(_focusRootNodeId, out _);
+        }
+    }
 
     public bool IsAnimating => _animator.IsAnimating;
 
@@ -119,15 +187,49 @@ public sealed class TreemapController
     /// Re-lays out the current snapshot. Called after a publish or option change.
     /// The focused subtree is used as the layout root, so drilling into a folder
     /// re-lays out that folder's contents across the whole content rect.
+    /// A changed source <see cref="TreemapSnapshot.RootPath"/> resets
+    /// focus/selection/hover/camera/history and the tooltip cache, so a new scan
+    /// never lands on a coincidentally reused id; same-source previews keep focus.
+    /// Otherwise stale history entries are pruned, and a focus that no longer
+    /// exists resets to the snapshot root.
     /// </summary>
     public void Relayout(bool animate = true)
     {
         TreemapSnapshot snapshot = _publisher.Current;
-        TreemapNode root = snapshot.TryGetNode(_focusRootNodeId, out TreemapNode focused)
-            ? focused
-            : snapshot.Root;
 
-        LayoutResult next = SquarifyLayout.Compute(root, ContentBounds, _options);
+        if (!SourcesMatch(_focusSource, snapshot.RootPath))
+        {
+            _focusSource = snapshot.RootPath;
+            _focusRootNodeId = snapshot.Root.Id;
+            _backStack.Clear();
+            _forwardStack.Clear();
+            _hoveredNodeId = -1;
+            _selectedNodeId = -1;
+            _tooltipNodeId = -1;
+            _tooltipVersion = -1;
+            _tooltipText = null;
+            _camera.Reset();
+            _camera.FitToContent(ContentBounds, _viewport);
+            Raise(ChangeKind.Navigation | ChangeKind.Camera | ChangeKind.Hover | ChangeKind.Selection);
+        }
+        else
+        {
+            PruneHistory(snapshot);
+
+            if (!snapshot.TryGetNode(_focusRootNodeId, out _))
+            {
+                _focusRootNodeId = snapshot.Root.Id;
+                _backStack.Clear();
+                _forwardStack.Clear();
+                _camera.Reset();
+                _camera.FitToContent(ContentBounds, _viewport);
+            }
+        }
+
+        snapshot.TryGetNode(_focusRootNodeId, out TreemapNode? focusNode);
+        focusNode ??= snapshot.Root;
+
+        LayoutResult next = SquarifyLayout.Compute(focusNode, ContentBounds, _options);
 
         if (animate && !_layout.IsEmpty)
         {
@@ -215,66 +317,209 @@ public sealed class TreemapController
     }
 
     /// <summary>Navigates into the hovered folder and fills the viewport with it.</summary>
-    public bool ZoomIntoHovered()
+    public bool ZoomIntoHovered() => _hoveredNodeId >= 0 && FocusNode(_hoveredNodeId);
+
+    /// <summary>
+    /// Focuses <paramref name="nodeId"/>, pushing the current view onto the back
+    /// stack and clearing forward history. Only nodes with children can be focused;
+    /// focusing the already-focused node is a no-op. The newly focused subtree is
+    /// fitted to the viewport; the previous camera is kept in history.
+    /// </summary>
+    public bool FocusNode(int nodeId)
     {
-        if (_hoveredNodeId < 0)
+        if (nodeId == _focusRootNodeId)
         {
             return false;
         }
 
         TreemapSnapshot snapshot = _publisher.Current;
-        if (!snapshot.TryGetNode(_hoveredNodeId, out TreemapNode node) || node.Children.Count == 0)
+        if (!snapshot.TryGetNode(nodeId, out TreemapNode node) || node.Children.Count == 0)
         {
             return false;
         }
 
-        _history.Add(new NavigationEntry(_focusRootNodeId, _camera.Capture()));
-        _focusRootNodeId = _hoveredNodeId;
-        Raise(ChangeKind.Navigation);
-        return true;
-    }
-
-    /// <summary>Returns to the parent of the current focus root.</summary>
-    public bool GoToParent()
-    {
-        if (_focusRootNodeId < 0)
-        {
-            return false;
-        }
-
-        TreemapSnapshot snapshot = _publisher.Current;
-        if (!snapshot.TryGetNode(_focusRootNodeId, out TreemapNode node))
-        {
-            return false;
-        }
-
-        // The parent of the focused node, within the current focus subtree.
-        int parent = FindParentInLayout(_focusRootNodeId);
-        if (parent < 0 && _history.Count == 0)
-        {
-            return false;
-        }
-
-        _focusRootNodeId = parent >= 0 ? parent : _history[^1].FocusRootNodeId;
-        if (parent < 0 && _history.Count > 0)
-        {
-            _camera.Apply(_history[^1].Camera);
-            _history.RemoveAt(_history.Count - 1);
-        }
-
-        Raise(ChangeKind.Navigation);
-        return true;
-    }
-
-    /// <summary>Resets the view to the whole drive.</summary>
-    public void GoToRoot()
-    {
-        TreemapSnapshot snapshot = _publisher.Current;
-        _focusRootNodeId = snapshot.Root.Id;
-        _history.Clear();
+        PushBack();
+        _forwardStack.Clear();
+        _focusRootNodeId = nodeId;
         _camera.Reset();
         _camera.FitToContent(ContentBounds, _viewport);
+        Raise(ChangeKind.Navigation | ChangeKind.Camera);
+        return true;
+    }
+
+    /// <summary>
+    /// Moves one level to the true parent resolved from the whole snapshot, not
+    /// from the current focused layout or the history stack. Branches: forward
+    /// history is cleared. The parent subtree is fitted to the viewport.
+    /// </summary>
+    public bool GoToParent()
+    {
+        TreemapSnapshot snapshot = _publisher.Current;
+        if (!snapshot.TryGetNode(_focusRootNodeId, out _)
+            || !snapshot.TryGetParent(_focusRootNodeId, out int parentId))
+        {
+            return false;
+        }
+
+        PushBack();
+        _forwardStack.Clear();
+        _focusRootNodeId = parentId;
+        _camera.Reset();
+        _camera.FitToContent(ContentBounds, _viewport);
+        Raise(ChangeKind.Navigation | ChangeKind.Camera);
+        return true;
+    }
+
+    /// <summary>Steps back through navigation history, restoring focus and camera.</summary>
+    public bool GoBack()
+    {
+        if (_backStack.Count == 0)
+        {
+            return false;
+        }
+
+        _forwardStack.Add(new NavigationEntry(_focusRootNodeId, _camera.Capture()));
+        NavigationEntry entry = _backStack[^1];
+        _backStack.RemoveAt(_backStack.Count - 1);
+
+        _focusRootNodeId = entry.FocusRootNodeId;
+        _camera.Apply(entry.Camera);
         Raise(ChangeKind.Navigation);
+        return true;
+    }
+
+    /// <summary>Steps forward through navigation history, restoring focus and camera.</summary>
+    public bool GoForward()
+    {
+        if (_forwardStack.Count == 0)
+        {
+            return false;
+        }
+
+        _backStack.Add(new NavigationEntry(_focusRootNodeId, _camera.Capture()));
+        NavigationEntry entry = _forwardStack[^1];
+        _forwardStack.RemoveAt(_forwardStack.Count - 1);
+
+        _focusRootNodeId = entry.FocusRootNodeId;
+        _camera.Apply(entry.Camera);
+        Raise(ChangeKind.Navigation);
+        return true;
+    }
+
+    /// <summary>
+    /// Resets the view to the whole drive, refitting the camera even when already
+    /// at the root. Branches: forward history is cleared. Returns false when
+    /// already home with a fitted camera and empty forward history.
+    /// </summary>
+    public bool GoToRoot()
+    {
+        TreemapSnapshot snapshot = _publisher.Current;
+        int rootId = snapshot.Root.Id;
+
+        if (_focusRootNodeId == rootId)
+        {
+            bool fitted = !IsCameraOffFit();
+            if (_forwardStack.Count == 0 && fitted)
+            {
+                return false;
+            }
+
+            _forwardStack.Clear();
+            _camera.Reset();
+            _camera.FitToContent(ContentBounds, _viewport);
+            Raise(ChangeKind.Navigation | ChangeKind.Camera);
+            return true;
+        }
+
+        PushBack();
+        _forwardStack.Clear();
+        _focusRootNodeId = rootId;
+        _camera.Reset();
+        _camera.FitToContent(ContentBounds, _viewport);
+        Raise(ChangeKind.Navigation | ChangeKind.Camera);
+        return true;
+    }
+
+    /// <summary>
+    /// Shows one more descendant level without touching camera zoom or rescanning.
+    /// </summary>
+    public bool IncreaseDetail()
+    {
+        if (!CanIncreaseDetail)
+        {
+            return false;
+        }
+
+        _options = _options.With(maxDepth: _options.MaxDepth + 1);
+        Raise(ChangeKind.Layout);
+        return true;
+    }
+
+    /// <summary>Shows one fewer descendant level without touching camera zoom.</summary>
+    public bool DecreaseDetail()
+    {
+        if (!CanDecreaseDetail)
+        {
+            return false;
+        }
+
+        _options = _options.With(maxDepth: _options.MaxDepth - 1);
+        Raise(ChangeKind.Layout);
+        return true;
+    }
+
+    /// <summary>Replaces the layout options. The caller relayouts afterwards.</summary>
+    public void SetLayoutOptions(LayoutOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        _options = options;
+        Raise(ChangeKind.Layout);
+    }
+
+    /// <summary>
+    /// Layout-only visibility for the synthetic space blocks. Hiding them reflows
+    /// the map; the snapshot, scan counts and totals are preserved. The caller
+    /// relayouts afterwards; nothing here rescans.
+    /// </summary>
+    public void SetSpaceVisibility(bool showFreeSpace, bool showUnknownSpace)
+    {
+        if (showFreeSpace == _options.ShowFreeSpace && showUnknownSpace == _options.ShowUnknownSpace)
+        {
+            return;
+        }
+
+        _options = _options.With(showFreeSpace: showFreeSpace, showUnknownSpace: showUnknownSpace);
+        Raise(ChangeKind.Layout);
+    }
+
+    /// <summary>
+    /// Tooltip text for a node: its snapshot path plus logical/allocated size.
+    /// Read from the captured snapshot only, never the filesystem, and cached per
+    /// node and snapshot version so mouse movement does not rebuild the path.
+    /// </summary>
+    public string GetTooltipText(int nodeId)
+    {
+        TreemapSnapshot snapshot = _publisher.Current;
+
+        if (nodeId == _tooltipNodeId && snapshot.Version == _tooltipVersion && _tooltipText is not null)
+        {
+            return _tooltipText;
+        }
+
+        string text = string.Empty;
+        if (nodeId >= 0 && snapshot.TryGetNode(nodeId, out TreemapNode? node))
+        {
+            string path = snapshot.GetPath(nodeId);
+            text = node.PhysicalSize > 0 && node.PhysicalSize != node.LogicalSize
+                ? $"{path}\n{SizeFormat.FormatBytes(node.LogicalSize)} logical, {SizeFormat.FormatBytes(node.PhysicalSize)} allocated"
+                : $"{path}\n{SizeFormat.FormatBytes(SizeFormat.DisplaySize(node.LogicalSize, node.PhysicalSize))}";
+        }
+
+        _tooltipNodeId = nodeId;
+        _tooltipVersion = snapshot.Version;
+        _tooltipText = text;
+        return text;
     }
 
     /// <summary>Returns and clears accumulated changes since the last call.</summary>
@@ -285,15 +530,74 @@ public sealed class TreemapController
         return result;
     }
 
-    private int FindParentInLayout(int nodeId)
+    /// <summary>
+    /// Records the current view for Back, skipping a push when the top already
+    /// holds it so repeated navigation cannot stack duplicates.
+    /// </summary>
+    private void PushBack()
     {
-        if (!_layout.TryGetIndex(nodeId, out int index))
+        if (_backStack.Count > 0 && _backStack[^1].FocusRootNodeId == _focusRootNodeId)
         {
-            return -1;
+            return;
         }
 
-        int parentIndex = _layout.ParentIndices[index];
-        return parentIndex >= 0 ? _layout.NodeIds[parentIndex] : -1;
+        _backStack.Add(new NavigationEntry(_focusRootNodeId, _camera.Capture()));
+        if (_backStack.Count > MaxHistoryEntries)
+        {
+            _backStack.RemoveAt(0);
+        }
+    }
+
+    /// <summary>
+    /// Drops history entries whose nodes are gone from the new snapshot, so a
+    /// rescan never lands Back on a coincidentally matching id, and trims the
+    /// stacks to their bound.
+    /// </summary>
+    private void PruneHistory(TreemapSnapshot snapshot)
+    {
+        _backStack.RemoveAll(entry => !snapshot.TryGetNode(entry.FocusRootNodeId, out _));
+        _forwardStack.RemoveAll(entry => !snapshot.TryGetNode(entry.FocusRootNodeId, out _));
+
+        while (_backStack.Count > MaxHistoryEntries)
+        {
+            _backStack.RemoveAt(0);
+        }
+
+        while (_forwardStack.Count > MaxHistoryEntries)
+        {
+            _forwardStack.RemoveAt(0);
+        }
+    }
+
+    private static bool SourcesMatch(string? a, string? b)
+    {
+        if (a is null || b is null)
+        {
+            return a is null && b is null;
+        }
+
+        // Match scanner path identity: case-insensitive on Windows,
+        // case-sensitive everywhere else.
+        return OperatingSystem.IsWindows()
+            ? string.Equals(a, b, StringComparison.OrdinalIgnoreCase)
+            : string.Equals(a, b, StringComparison.Ordinal);
+    }
+
+    /// <summary>True when the camera differs from a fresh fit of the viewport.</summary>
+    private bool IsCameraOffFit()
+    {
+        if (_viewport.IsEmpty)
+        {
+            return false;
+        }
+
+        TreemapCamera fitted = new();
+        fitted.FitToContent(ContentBounds, _viewport);
+        const float zoomTol = 1e-4f;
+        const float panTol = 0.5f;
+        return MathF.Abs(_camera.Zoom - fitted.Zoom) > zoomTol
+            || MathF.Abs(_camera.Pan.X - fitted.Pan.X) > panTol
+            || MathF.Abs(_camera.Pan.Y - fitted.Pan.Y) > panTol;
     }
 
     private readonly record struct NavigationEntry(int FocusRootNodeId, CameraTransform Camera);

@@ -24,8 +24,8 @@ internal delegate Task<ScanResult> ScanRunner(
 /// Scanning runs on a worker thread and every callback returns through the UI
 /// synchronization context. Each start takes the next generation number and hands it to
 /// that scan's callbacks, which drop anything from an older or finished one. Nothing is
-/// published here: the scanner publishes the finished tree once, from its own thread, so
-/// a cancelled or failed scan leaves the current treemap on screen.
+/// published here: the scanner publishes intermediate previews as they arrive and a final
+/// snapshot at the end, restoring the prior snapshot when a scan is cancelled or fails.
 /// </remarks>
 internal sealed class ScanShell : Form
 {
@@ -52,6 +52,17 @@ internal sealed class ScanShell : Form
     private readonly Label _backendLabel = new() { AutoSize = true };
     private readonly Label _progressLabel = new() { AutoSize = true };
     private readonly Label _statusLabel = new() { AutoSize = true };
+
+    private readonly Button _backButton = new() { Text = "Back", AutoSize = true, Enabled = false };
+    private readonly Button _forwardButton = new() { Text = "Forward", AutoSize = true, Enabled = false };
+    private readonly Button _upButton = new() { Text = "Up", AutoSize = true, Enabled = false };
+    private readonly Button _homeButton = new() { Text = "Home", AutoSize = true, Enabled = false };
+    private readonly Button _moreButton = new() { Text = "More detail", AutoSize = true };
+    private readonly Button _lessButton = new() { Text = "Less detail", AutoSize = true, Enabled = false };
+    private readonly CheckBox _freeBox = new() { Text = "Free space", Appearance = Appearance.Button, AutoSize = true };
+    private readonly CheckBox _unaccountedBox = new() { Text = "Unaccounted space", Appearance = Appearance.Button, AutoSize = true };
+
+    private bool _refreshingNav;
 
     /// <summary>One scanner for the shell, so node ids stay put across rescans.</summary>
     private readonly FileSystemScanner _scanner = new();
@@ -104,6 +115,10 @@ internal sealed class ScanShell : Form
             // The scanner throttles against this itself; a quarter second is often enough
             // for a label and cheap enough for a volume walk.
             ProgressInterval = TimeSpan.FromMilliseconds(250),
+
+            // The desktop shows the scan as it arrives. Explicitly injected options
+            // are left exactly as given so tests stay predictable.
+            PublishIntermediateSnapshots = true,
         };
 
         _startupPath = startupPath;
@@ -119,6 +134,18 @@ internal sealed class ScanShell : Form
         _refreshButton.Click += (_, _) => _ = LoadVolumesAsync();
         _volumeBox.SelectedIndexChanged += OnVolumeSelected;
         _pathBox.KeyDown += OnPathKeyDown;
+
+        _backButton.Click += (_, _) => Navigate(() => _view.Controller.GoBack());
+        _forwardButton.Click += (_, _) => Navigate(() => _view.Controller.GoForward());
+        _upButton.Click += (_, _) => Navigate(() => _view.Controller.GoToParent());
+        _homeButton.Click += (_, _) => Navigate(() => _view.Controller.GoToRoot());
+        _moreButton.Click += (_, _) => ChangeDetail(increase: true);
+        _lessButton.Click += (_, _) => ChangeDetail(increase: false);
+        _freeBox.CheckedChanged += (_, _) => ApplySpaceVisibility();
+        _unaccountedBox.CheckedChanged += (_, _) => ApplySpaceVisibility();
+
+        _view.Controller.Changed += OnViewChanged;
+        RefreshNav();
     }
 
     // ---- state the tests read ----
@@ -138,6 +165,22 @@ internal sealed class ScanShell : Form
     internal string ProgressText => _progressLabel.Text;
 
     internal string StatusText => _statusLabel.Text;
+
+    internal Button BackButton => _backButton;
+
+    internal Button ForwardButton => _forwardButton;
+
+    internal Button UpButton => _upButton;
+
+    internal Button HomeButton => _homeButton;
+
+    internal Button MoreDetailButton => _moreButton;
+
+    internal Button LessDetailButton => _lessButton;
+
+    internal CheckBox FreeSpaceBox => _freeBox;
+
+    internal CheckBox UnaccountedSpaceBox => _unaccountedBox;
 
     // ---- layout ----
 
@@ -165,6 +208,27 @@ internal sealed class ScanShell : Form
         toolbar.Controls.Add(_scanButton);
         toolbar.Controls.Add(_cancelButton);
 
+        // Reference-style navigation and view controls: history, actual parent,
+        // visible depth and the two independent space toggles. Compact buttons in
+        // a wrapping row so they stay reachable when the window is narrow.
+        FlowLayoutPanel navBar = new()
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(6, 0, 6, 4),
+        };
+
+        navBar.Controls.Add(_backButton);
+        navBar.Controls.Add(_forwardButton);
+        navBar.Controls.Add(_upButton);
+        navBar.Controls.Add(_homeButton);
+        navBar.Controls.Add(_moreButton);
+        navBar.Controls.Add(_lessButton);
+        navBar.Controls.Add(_freeBox);
+        navBar.Controls.Add(_unaccountedBox);
+
         FlowLayoutPanel status = new()
         {
             Dock = DockStyle.Bottom,
@@ -179,8 +243,10 @@ internal sealed class ScanShell : Form
         status.Controls.Add(_statusLabel);
 
         // Added fill first: WinForms docks from the last child back, so the view is laid
-        // out last and takes whatever the two panels leave behind.
+        // out last and takes whatever the two panels leave behind. The navigation bar
+        // is added before the scan toolbar so it docks directly beneath it.
         Controls.Add(_view);
+        Controls.Add(navBar);
         Controls.Add(toolbar);
         Controls.Add(status);
 
@@ -323,6 +389,103 @@ internal sealed class ScanShell : Form
 
         e.SuppressKeyPress = true;
         StartScan(_pathBox.Text);
+    }
+
+    // ---- navigation and view ----
+
+    /// <summary>
+    /// Runs one history navigation and re-lays out the newly focused subtree.
+    /// Layout only: navigation never rescans.
+    /// </summary>
+    private void Navigate(Func<bool> move)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (move())
+        {
+            _view.Controller.Relayout(animate: true);
+        }
+
+        RefreshNav();
+    }
+
+    private void ChangeDetail(bool increase)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        bool changed = increase
+            ? _view.Controller.IncreaseDetail()
+            : _view.Controller.DecreaseDetail();
+
+        if (changed)
+        {
+            _view.Controller.Relayout(animate: true);
+        }
+
+        RefreshNav();
+    }
+
+    /// <summary>
+    /// Layout-only space filters. Hiding a block reflows the map; the snapshot,
+    /// scan counts and totals are preserved and nothing rescans.
+    /// </summary>
+    private void ApplySpaceVisibility()
+    {
+        if (_disposed || _refreshingNav)
+        {
+            return;
+        }
+
+        _view.Controller.SetSpaceVisibility(_freeBox.Checked, _unaccountedBox.Checked);
+        _view.Controller.Relayout(animate: true);
+        RefreshNav();
+    }
+
+    private void OnViewChanged(ChangeKind kind)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        RefreshNav();
+    }
+
+    /// <summary>
+    /// Mirrors controller state onto the toolbar: history buttons enable with
+    /// entries, detail buttons disable at their depth limits, and the space
+    /// boxes check with the layout filters.
+    /// </summary>
+    internal void RefreshNav()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        TreemapController controller = _view.Controller;
+        _refreshingNav = true;
+        try
+        {
+            _backButton.Enabled = controller.CanGoBack;
+            _forwardButton.Enabled = controller.CanGoForward;
+            _upButton.Enabled = controller.CanGoUp;
+            _homeButton.Enabled = controller.CanGoHome;
+            _moreButton.Enabled = controller.CanIncreaseDetail;
+            _lessButton.Enabled = controller.CanDecreaseDetail;
+            _freeBox.Checked = controller.ShowFreeSpace;
+            _unaccountedBox.Checked = controller.ShowUnknownSpace;
+        }
+        finally
+        {
+            _refreshingNav = false;
+        }
     }
 
     // ---- scanning ----
@@ -699,6 +862,7 @@ internal sealed class ScanShell : Form
         if (disposing && !_disposed)
         {
             _disposed = true;
+            _view.Controller.Changed -= OnViewChanged;
             RequestCancel(_scanCts);
         }
 

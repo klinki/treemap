@@ -49,6 +49,25 @@ public static class SquarifyLayout
         int rootCell = -1;
         if (IsRenderable(bounds, options))
         {
+            RectF header = RectF.Empty;
+            RectF content = bounds;
+            if (WantsHeader(hasChildren: root.Children.Count > 0, root.Kind, options)
+                && IsExpanded(root, depth: 0, bounds, options))
+            {
+                float strip = options.HeaderHeight;
+                RectF remainder = new(bounds.X, bounds.Y + strip, bounds.Width, bounds.Height - strip);
+                if (!remainder.IsEmpty)
+                {
+                    header = new RectF(bounds.X, bounds.Y, bounds.Width, strip);
+                    content = remainder;
+                }
+            }
+
+            if (options.InnerPadding > 0f)
+            {
+                content = content.InsetUniform(options.InnerPadding);
+            }
+
             rootCell = cells.Count;
             cells.Add(new LayoutCell
             {
@@ -60,15 +79,14 @@ public static class SquarifyLayout
                 AreaFraction = 1f,
                 HasChildren = root.Children.Count > 0,
                 ParentIndex = -1,
+                HeaderBounds = header,
+                LogicalSize = root.LogicalSize,
+                PhysicalSize = root.PhysicalSize,
             });
-        }
 
-        if (root.Children.Count > 0)
-        {
-            RectF content = options.InnerPadding > 0f ? bounds.InsetUniform(options.InnerPadding) : bounds;
-            if (!content.IsEmpty)
+            if (root.Children.Count > 0 && IsExpanded(root, depth: 0, bounds, options) && !content.IsEmpty)
             {
-                buffers[1] = Fill(buffers[1], root.Children, out int rootChildCount);
+                buffers[1] = Fill(buffers[1], root.Children, options, out int rootChildCount);
                 Normalize(buffers[1], rootChildCount, content.Area);
                 Squarify(
                     buffers[1], rootChildCount, content, depth: 1, parentIndex: rootCell,
@@ -77,6 +95,99 @@ public static class SquarifyLayout
         }
 
         return LayoutResult.Build(cells, rootCell);
+    }
+
+    /// <summary>
+    /// Headers belong to folders and drives that actually have children to show
+    /// beneath them. Files and space blocks never carry one.
+    /// </summary>
+    private static bool WantsHeader(bool hasChildren, NodeKind kind, LayoutOptions options)
+        => hasChildren
+            && options.ShowHeaders
+            && options.HeaderHeight > 0f
+            && kind is NodeKind.Folder or NodeKind.Drive;
+
+    /// <summary>
+    /// True when a node has at least one layout-visible child with positive size.
+    /// Hidden-only or zero-size children leave nothing to expand into, so the
+    /// node renders collapsed with no header and no recursion.
+    /// </summary>
+    private static bool HasExpandableChildren(TreemapNode node, LayoutOptions options)
+    {
+        foreach (TreemapNode child in node.Children)
+        {
+            if (!IsSpaceVisible(child, options))
+            {
+                continue;
+            }
+
+            if (child.LayoutSize > 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// True when a node at <paramref name="depth"/> in <paramref name="rect"/> will
+    /// actually show children: depth budget remains, a visible child exists, and
+    /// the rect leaves usable child space after any header strip and padding.
+    /// </summary>
+    private static bool IsExpanded(TreemapNode node, int depth, in RectF rect, LayoutOptions options)
+    {
+        if (node.Children.Count == 0 || depth >= options.MaxDepth)
+        {
+            return false;
+        }
+
+        if (!HasExpandableChildren(node, options))
+        {
+            return false;
+        }
+
+        RectF inner = rect;
+        if (WantsHeader(hasChildren: true, node.Kind, options))
+        {
+            if (rect.Height <= options.HeaderHeight)
+            {
+                return false;
+            }
+
+            inner = new RectF(rect.X, rect.Y + options.HeaderHeight, rect.Width, rect.Height - options.HeaderHeight);
+            if (inner.IsEmpty)
+            {
+                return false;
+            }
+        }
+
+        if (options.InnerPadding > 0f)
+        {
+            inner = inner.InsetUniform(options.InnerPadding);
+        }
+
+        return !inner.IsEmpty;
+    }
+
+    /// <summary>
+    /// Layout-only visibility for the synthetic space blocks. Hidden kinds are
+    /// skipped before normalisation, so the remaining siblings absorb their area.
+    /// The snapshot tree itself is never touched.
+    /// </summary>
+    internal static bool IsSpaceVisible(TreemapNode node, LayoutOptions options)
+    {
+        if (node.Kind == NodeKind.FreeSpace)
+        {
+            return options.ShowFreeSpace;
+        }
+
+        if (node.Kind is NodeKind.UnknownSpace or NodeKind.MissingData)
+        {
+            return options.ShowUnknownSpace;
+        }
+
+        return true;
     }
 
     /// <summary>Lays out a sorted, normalised run of children inside <paramref name="rect"/>.</summary>
@@ -206,6 +317,67 @@ public static class SquarifyLayout
 
         bool hasChildren = node.Children.Count > 0;
 
+        int AddCollapsed()
+        {
+            int index = cells.Count;
+            cells.Add(new LayoutCell
+            {
+                NodeId = node.Id,
+                Bounds = rect,
+                Depth = depth,
+                Kind = node.Kind,
+                ColorGroup = node.ColorGroup,
+                AreaFraction = totalArea > 0f ? rect.Area / totalArea : 0f,
+                HasChildren = hasChildren,
+                ParentIndex = parentIndex,
+                HeaderBounds = RectF.Empty,
+                LogicalSize = node.LogicalSize,
+                PhysicalSize = node.PhysicalSize,
+            });
+            return index;
+        }
+
+        // Collapsed when the depth budget is spent or there is nothing visible to
+        // expand into: no header, no recursion, centred label.
+        if (!hasChildren || depth >= options.MaxDepth || !HasExpandableChildren(node, options))
+        {
+            return AddCollapsed();
+        }
+
+        // A folder header is a strip across the top of the cell; children tile
+        // the remainder, so the strip never overlaps them. A cell too short to
+        // leave usable child space collapses: no header, no recursion.
+        RectF header = RectF.Empty;
+        RectF inner = rect;
+        bool wantsHeader = WantsHeader(hasChildren: true, node.Kind, options);
+        if (wantsHeader)
+        {
+            if (rect.Height > options.HeaderHeight)
+            {
+                RectF remainder = new(rect.X, rect.Y + options.HeaderHeight, rect.Width, rect.Height - options.HeaderHeight);
+                if (!remainder.IsEmpty)
+                {
+                    header = new RectF(rect.X, rect.Y, rect.Width, options.HeaderHeight);
+                    inner = remainder;
+                }
+            }
+
+            if (header.IsEmpty)
+            {
+                return AddCollapsed();
+            }
+        }
+
+        if (options.InnerPadding > 0f)
+        {
+            inner = inner.InsetUniform(options.InnerPadding);
+        }
+
+        if (inner.IsEmpty)
+        {
+            return AddCollapsed();
+        }
+
         int selfIndex = cells.Count;
         cells.Add(new LayoutCell
         {
@@ -217,18 +389,10 @@ public static class SquarifyLayout
             AreaFraction = totalArea > 0f ? rect.Area / totalArea : 0f,
             HasChildren = hasChildren,
             ParentIndex = parentIndex,
+            HeaderBounds = header,
+            LogicalSize = node.LogicalSize,
+            PhysicalSize = node.PhysicalSize,
         });
-
-        if (!hasChildren || depth >= options.MaxDepth)
-        {
-            return selfIndex;
-        }
-
-        RectF inner = options.InnerPadding > 0f ? rect.InsetUniform(options.InnerPadding) : rect;
-        if (inner.IsEmpty)
-        {
-            return selfIndex;
-        }
 
         int nextDepth = depth + 1;
         if (nextDepth >= buffers.Length)
@@ -237,7 +401,7 @@ public static class SquarifyLayout
         }
 
         Entry[] buffer = buffers[nextDepth];
-        buffer = Fill(buffer, node.Children, out int childCount);
+        buffer = Fill(buffer, node.Children, options, out int childCount);
         buffers[nextDepth] = buffer;
         Normalize(buffer, childCount, inner.Area);
 
@@ -248,25 +412,31 @@ public static class SquarifyLayout
     }
 
     /// <summary>
-    /// Loads children into the scratch buffer for a depth level, growing it if
+    /// Loads visible children into the scratch buffer for a depth level, growing it if
     /// needed. Returns the (possibly new) buffer — the caller must store it back
     /// into <c>buffers[depth]</c>, since Array.Resize copies on growth.
     /// </summary>
     private static Entry[] Fill(
-        Entry[] buffer, IReadOnlyList<TreemapNode> children, out int count)
+        Entry[] buffer, IReadOnlyList<TreemapNode> children, LayoutOptions options, out int count)
     {
-        count = children.Count;
-        if (buffer.Length < count)
+        if (buffer.Length < children.Count)
         {
-            int capacity = Math.Max(count, buffer.Length * 2);
+            int capacity = Math.Max(children.Count, buffer.Length * 2);
             Array.Resize(ref buffer, capacity);
         }
 
-        for (int i = 0; i < count; i++)
+        count = 0;
+        for (int i = 0; i < children.Count; i++)
         {
             TreemapNode child = children[i];
+            if (!IsSpaceVisible(child, options))
+            {
+                continue;
+            }
+
             long size = child.LayoutSize;
-            buffer[i] = new Entry { Node = child, Area = size > 0 ? size : 0d };
+            buffer[count] = new Entry { Node = child, Area = size > 0 ? size : 0d };
+            count++;
         }
 
         return buffer;

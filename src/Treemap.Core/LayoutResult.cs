@@ -21,7 +21,42 @@ public sealed class LayoutOptions
     /// </summary>
     public float InnerPadding { get; init; }
 
+    /// <summary>
+    /// Reserves a header strip above each folder's children. Off by default so library
+    /// callers keep the historic header-free tiling; the desktop host enables it.
+    /// </summary>
+    public bool ShowHeaders { get; init; }
+
+    /// <summary>Height of the folder header strip, in content units.</summary>
+    public float HeaderHeight { get; init; } = 22f;
+
+    /// <summary>Hides the free-space block from layout when false. The snapshot is untouched.</summary>
+    public bool ShowFreeSpace { get; init; } = true;
+
+    /// <summary>Hides the unaccounted-space block from layout when false. The snapshot is untouched.</summary>
+    public bool ShowUnknownSpace { get; init; } = true;
+
     public static LayoutOptions Default { get; } = new();
+
+    /// <summary>Copies these options with selected overrides.</summary>
+    public LayoutOptions With(
+        float? minCellSize = null,
+        int? maxDepth = null,
+        float? innerPadding = null,
+        bool? showHeaders = null,
+        float? headerHeight = null,
+        bool? showFreeSpace = null,
+        bool? showUnknownSpace = null)
+        => new()
+        {
+            MinCellSize = minCellSize ?? MinCellSize,
+            MaxDepth = maxDepth ?? MaxDepth,
+            InnerPadding = innerPadding ?? InnerPadding,
+            ShowHeaders = showHeaders ?? ShowHeaders,
+            HeaderHeight = headerHeight ?? HeaderHeight,
+            ShowFreeSpace = showFreeSpace ?? ShowFreeSpace,
+            ShowUnknownSpace = showUnknownSpace ?? ShowUnknownSpace,
+        };
 
     /// <summary>
     /// "More detail" preset: smaller minimum cell, so more
@@ -56,6 +91,18 @@ public readonly struct LayoutCell
     /// to the root for the ancestor highlight path without re-deriving the tree.
     /// </summary>
     public required int ParentIndex { get; init; }
+
+    /// <summary>
+    /// Header strip reserved above this cell's children. Empty for leaves and when
+    /// headers are disabled, in which case labels are drawn centred in the cell.
+    /// </summary>
+    public RectF HeaderBounds { get; init; }
+
+    /// <summary>Apparent size in bytes, carried for labels and tooltips.</summary>
+    public long LogicalSize { get; init; }
+
+    /// <summary>Allocated size in bytes, carried for labels and tooltips.</summary>
+    public long PhysicalSize { get; init; }
 }
 
 /// <summary>
@@ -76,6 +123,9 @@ public sealed class LayoutResult
         float[] areaFractions,
         bool[] hasChildren,
         int[] parentIndices,
+        RectF[] headerBounds,
+        long[] logicalSizes,
+        long[] physicalSizes,
         Dictionary<int, int> index,
         int rootCell)
     {
@@ -87,6 +137,9 @@ public sealed class LayoutResult
         AreaFractions = areaFractions;
         HasChildren = hasChildren;
         ParentIndices = parentIndices;
+        HeaderBounds = headerBounds;
+        LogicalSizes = logicalSizes;
+        PhysicalSizes = physicalSizes;
         _index = index;
         RootCell = rootCell;
     }
@@ -108,6 +161,15 @@ public sealed class LayoutResult
     /// <summary>Parent cell index per cell, or -1 for the root.</summary>
     public int[] ParentIndices { get; }
 
+    /// <summary>Header strip per cell, or <see cref="RectF.Empty"/> when the cell has none.</summary>
+    public RectF[] HeaderBounds { get; }
+
+    /// <summary>Apparent size per cell, for labels and tooltips.</summary>
+    public long[] LogicalSizes { get; }
+
+    /// <summary>Allocated size per cell, for labels and tooltips.</summary>
+    public long[] PhysicalSizes { get; }
+
     /// <summary>Index of the root node's cell, or -1 for an empty layout.</summary>
     public int RootCell { get; }
 
@@ -116,7 +178,7 @@ public sealed class LayoutResult
     public bool IsEmpty => NodeIds.Length == 0;
 
     public static LayoutResult Empty { get; } = new(
-        [], [], [], [], [], [], [], [], new Dictionary<int, int>(), -1);
+        [], [], [], [], [], [], [], [], [], [], [], new Dictionary<int, int>(), -1);
 
     public LayoutCell GetCell(int i) => new()
     {
@@ -128,6 +190,9 @@ public sealed class LayoutResult
         AreaFraction = AreaFractions[i],
         HasChildren = HasChildren[i],
         ParentIndex = ParentIndices[i],
+        HeaderBounds = HeaderBounds[i],
+        LogicalSize = LogicalSizes[i],
+        PhysicalSize = PhysicalSizes[i],
     };
 
     public bool TryGetIndex(int nodeId, out int index) => _index.TryGetValue(nodeId, out index);
@@ -156,6 +221,9 @@ public sealed class LayoutResult
         float[] areaFractions = new float[n];
         bool[] hasChildren = new bool[n];
         int[] parentIndices = new int[n];
+        RectF[] headerBounds = new RectF[n];
+        long[] logicalSizes = new long[n];
+        long[] physicalSizes = new long[n];
 
         Dictionary<int, int> index = new(n);
         for (int i = 0; i < n; i++)
@@ -169,12 +237,15 @@ public sealed class LayoutResult
             areaFractions[i] = c.AreaFraction;
             hasChildren[i] = c.HasChildren;
             parentIndices[i] = c.ParentIndex;
+            headerBounds[i] = c.HeaderBounds;
+            logicalSizes[i] = c.LogicalSize;
+            physicalSizes[i] = c.PhysicalSize;
             index[c.NodeId] = i;
         }
 
         return new LayoutResult(
             nodeIds, bounds, depths, kinds, colorGroups, areaFractions, hasChildren,
-            parentIndices, index, rootCell);
+            parentIndices, headerBounds, logicalSizes, physicalSizes, index, rootCell);
     }
 
     /// <summary>

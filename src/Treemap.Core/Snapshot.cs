@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace Treemap;
 
 /// <summary>
@@ -21,18 +23,22 @@ namespace Treemap;
 public sealed class TreemapSnapshot
 {
     private readonly Dictionary<int, TreemapNode> _nodesById;
+    private readonly Dictionary<int, int> _parentById;
 
-    public TreemapSnapshot(TreemapNode root, long version, DateTimeOffset timestamp)
+    public TreemapSnapshot(TreemapNode root, long version, DateTimeOffset timestamp, string? rootPath = null)
     {
         ArgumentNullException.ThrowIfNull(root);
 
         Root = root;
         Version = version;
         Timestamp = timestamp;
+        RootPath = rootPath;
 
         Dictionary<int, TreemapNode> map = new(256);
-        Index(map, root);
+        Dictionary<int, int> parents = new(256);
+        Index(map, parents, root, parentId: -1);
         _nodesById = map;
+        _parentById = parents;
     }
 
     public TreemapNode Root { get; }
@@ -42,21 +48,80 @@ public sealed class TreemapSnapshot
 
     public DateTimeOffset Timestamp { get; }
 
+    /// <summary>
+    /// Optional source the tree was scanned from (normalized root path).
+    /// Null for legacy/synthetic callers. Lets the controller tell two different
+    /// scans apart when they reuse the same node ids.
+    /// </summary>
+    public string? RootPath { get; }
+
     public int NodeCount => _nodesById.Count;
 
     public bool TryGetNode(int id, out TreemapNode node) => _nodesById.TryGetValue(id, out node!);
 
-    /// <summary>Builds a snapshot with a fresh version number.</summary>
-    public static TreemapSnapshot Create(TreemapNode root, long version)
-        => new(root, version, DateTimeOffset.UtcNow);
+    /// <summary>
+    /// The true parent of a node in the whole snapshot, indexed once per publish.
+    /// Returns false for the root and for unknown ids.
+    /// </summary>
+    public bool TryGetParent(int id, out int parentId) => _parentById.TryGetValue(id, out parentId);
 
-    private static void Index(Dictionary<int, TreemapNode> map, TreemapNode node)
+    /// <summary>
+    /// Display path of a node, built from the snapshot alone with no filesystem I/O.
+    /// With a <see cref="RootPath"/>, the root resolves to that absolute source and
+    /// descendants append with the source's own separator style; otherwise segments
+    /// are joined with '/' and the root comes first.
+    /// </summary>
+    public string GetPath(int id)
+    {
+        if (!_nodesById.TryGetValue(id, out TreemapNode? node))
+        {
+            return id.ToString(CultureInfo.InvariantCulture);
+        }
+
+        List<string> segments = [node.Name];
+        int current = id;
+        while (_parentById.TryGetValue(current, out int parent)
+            && _nodesById.TryGetValue(parent, out TreemapNode? parentNode))
+        {
+            segments.Add(parentNode.Name);
+            current = parent;
+        }
+
+        segments.Reverse();
+
+        if (RootPath is { Length: > 0 } source)
+        {
+            if (segments.Count <= 1)
+            {
+                return source;
+            }
+
+            char sep = source.Contains('\\') ? '\\'
+                : source.Contains('/') ? '/'
+                : Path.DirectorySeparatorChar;
+            string trimmed = source.TrimEnd('\\', '/');
+            return trimmed + sep + string.Join(sep, segments.Skip(1));
+        }
+
+        return string.Join("/", segments);
+    }
+
+    /// <summary>Builds a snapshot with a fresh version number.</summary>
+    public static TreemapSnapshot Create(TreemapNode root, long version, string? rootPath = null)
+        => new(root, version, DateTimeOffset.UtcNow, rootPath);
+
+    private static void Index(
+        Dictionary<int, TreemapNode> map, Dictionary<int, int> parents, TreemapNode node, int parentId)
     {
         map[node.Id] = node;
+        if (parentId >= 0)
+        {
+            parents[node.Id] = parentId;
+        }
 
         foreach (TreemapNode child in node.Children)
         {
-            Index(map, child);
+            Index(map, parents, child, node.Id);
         }
     }
 }
@@ -76,11 +141,11 @@ public sealed class SnapshotPublisher
     private TreemapSnapshot _current;
     private long _version;
 
-    public SnapshotPublisher(TreemapNode emptyRoot)
+    public SnapshotPublisher(TreemapNode emptyRoot, string? rootPath = null)
     {
         ArgumentNullException.ThrowIfNull(emptyRoot);
 
-        _current = new TreemapSnapshot(emptyRoot, 0, DateTimeOffset.UtcNow);
+        _current = new TreemapSnapshot(emptyRoot, 0, DateTimeOffset.UtcNow, rootPath);
     }
 
     /// <summary>The most recently published snapshot. Safe to call from any thread.</summary>
@@ -104,8 +169,14 @@ public sealed class SnapshotPublisher
     /// <summary>
     /// Publishes a new snapshot built from <paramref name="root"/>. Returns the
     /// published instance so the caller can hand it straight to an animator.
+    /// Each publication stores exactly the supplied <paramref name="rootPath"/>
+    /// (null by default for legacy callers): nothing is inherited from the
+    /// previous snapshot, so a restore passes the prior
+    /// <see cref="TreemapSnapshot.RootPath"/> explicitly, including null when
+    /// restoring to the initial placeholder. Production publishers always pass
+    /// their source explicitly on previews, finals and restores.
     /// </summary>
-    public TreemapSnapshot Publish(TreemapNode root)
+    public TreemapSnapshot Publish(TreemapNode root, string? rootPath = null)
     {
         ArgumentNullException.ThrowIfNull(root);
 
@@ -113,7 +184,7 @@ public sealed class SnapshotPublisher
 
         lock (_publishLock)
         {
-            snapshot = new TreemapSnapshot(root, ++_version, DateTimeOffset.UtcNow);
+            snapshot = new TreemapSnapshot(root, ++_version, DateTimeOffset.UtcNow, rootPath);
 
             // Release-store, issued while the writer lock is still held. The version is
             // allocated and the reference is published as one step, so two concurrent

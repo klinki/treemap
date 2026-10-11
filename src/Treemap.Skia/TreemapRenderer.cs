@@ -18,9 +18,10 @@ public sealed class RenderState
     /// <summary>Draw labels.</summary>
     public bool ShowLabels { get; init; } = true;
 
-    /// <summary>Minimum font size in pixels; smaller labels are dropped.</summary>
+    /// <summary>Minimum font size in device pixels; smaller labels are dropped.</summary>
     public float MinFontSize { get; init; } = 6f;
 
+    /// <summary>Starting font size in device pixels, shrunk to fit the mapped cell.</summary>
     public float BaseFontSize { get; init; } = 12f;
 
     public string FontFamily { get; init; } = "Segoe UI";
@@ -41,6 +42,7 @@ public sealed class TreemapRenderer : IDisposable
     private readonly SKPaint _fillPaint = new() { Style = SKPaintStyle.Fill, IsAntialias = false };
     private readonly SKPaint _borderPaint = new() { Style = SKPaintStyle.Stroke, StrokeWidth = 1f, IsAntialias = false };
     private readonly SKPaint _highlightPaint = new() { Style = SKPaintStyle.Stroke, StrokeWidth = 2f, IsAntialias = false, Color = SKColors.White };
+    private readonly SKPaint _ancestorPaint = new() { Style = SKPaintStyle.Fill, IsAntialias = false, Color = SKColors.White.WithAlpha(44) };
     private readonly SKPaint _shadowPaint = new() { Style = SKPaintStyle.Fill, IsAntialias = true, Color = new SKColor(0, 0, 0, 0x66) };
     private readonly SKPaint _textPaint = new() { Style = SKPaintStyle.Fill, IsAntialias = true };
 
@@ -69,11 +71,17 @@ public sealed class TreemapRenderer : IDisposable
         ArgumentNullException.ThrowIfNull(state);
 
         // Pass 1: fills, back to front so nested children cover their parent. The
-        // hovered cell's index is picked up here, so neither the shadow nor the
-        // outline needs its own scan of the frame. Only cells that are actually
-        // drawn qualify: a cell that has faded out would otherwise get a phantom
-        // shadow and outline drawn over whatever replaced it.
+        // hovered cell is the deepest drawn match, found up front so its fill can
+        // be brightened inline and the ancestor pass below needs only the chain.
         int hoveredIndex = -1;
+
+        for (int i = 0; i < frame.Count; i++)
+        {
+            if (frame[i].Alpha > 0.01f && frame[i].NodeId == state.HoveredNodeId)
+            {
+                hoveredIndex = i;
+            }
+        }
 
         for (int i = 0; i < frame.Count; i++)
         {
@@ -83,13 +91,25 @@ public sealed class TreemapRenderer : IDisposable
                 continue;
             }
 
-            if (cell.NodeId == state.HoveredNodeId)
-            {
-                hoveredIndex = i;
-            }
-
-            _fillPaint.Color = _palette.Resolve(cell.Kind, cell.ColorGroup, cell.Depth, cell.Alpha);
+            SKColor fill = _palette.Resolve(cell.Kind, cell.ColorGroup, cell.Depth, cell.Alpha);
+            _fillPaint.Color = i == hoveredIndex ? Brighten(fill) : fill;
             canvas.DrawRect(ToSkia(cell.Bounds), _fillPaint);
+        }
+
+        // Pass 1b: ancestor chain. Only the reserved header strip of each
+        // ancestor is shaded, so unrelated subtrees keep their fills; outlines
+        // still mark the full chain. The chain is walked once via ParentIndex.
+        if (hoveredIndex >= 0)
+        {
+            List<int> path = HitTester.FramePathToRoot(frame, hoveredIndex, _hoverPath);
+            for (int i = path.Count - 1; i >= 1; i--)
+            {
+                TweenedCell ancestor = frame[path[i]];
+                if (ancestor.Alpha > 0.01f && !ancestor.HeaderBounds.IsEmpty)
+                {
+                    canvas.DrawRect(ToSkia(ancestor.HeaderBounds), _ancestorPaint);
+                }
+            }
         }
 
         // Pass 2: shadow under the highlighted element, then borders, then the
@@ -157,10 +177,24 @@ public sealed class TreemapRenderer : IDisposable
                 HasChildren = layout.HasChildren[i],
                 IsEntering = false,
                 ParentIndex = layout.ParentIndices[i],
+                HeaderBounds = layout.HeaderBounds[i],
+                LogicalSize = layout.LogicalSizes[i],
+                PhysicalSize = layout.PhysicalSizes[i],
             });
         }
 
         return _settledFrame;
+    }
+
+    /// <summary>Lightens a fill towards white for the hovered cell.</summary>
+    private static SKColor Brighten(SKColor color)
+    {
+        const float amount = 0.35f;
+        return new SKColor(
+            (byte)(color.Red + ((255 - color.Red) * amount)),
+            (byte)(color.Green + ((255 - color.Green) * amount)),
+            (byte)(color.Blue + ((255 - color.Blue) * amount)),
+            color.Alpha);
     }
 
     /// <summary>
@@ -196,62 +230,253 @@ public sealed class TreemapRenderer : IDisposable
             return;
         }
 
-        // The highlighted element is always an axis-aligned rect, so its shadow is
-        // simply that rect offset by a few pixels. No path needed.
+        // The highlight shadow must not darken the hovered interior: the offset
+        // rect overlaps it almost entirely, so it is clipped to the outside.
         const float offset = 3f;
+        canvas.Save();
+        canvas.ClipRect(ToSkia(bounds), SKClipOperation.Difference);
         canvas.DrawRect(
             ToSkia(new RectF(bounds.X + offset, bounds.Y + offset, bounds.Width, bounds.Height)),
             _shadowPaint);
+        canvas.Restore();
     }
 
     /// <summary>
-    /// Draws a label only when the cell can actually fit it.
+    /// Draws a label only when the cell can actually fit it. Folder headers carry
+    /// name plus size on one line in their strip; leaves, collapsed folders and
+    /// space blocks stack name above size when tall enough, so a long
+    /// name truncates on its own line instead of pushing the size away. Text is
+    /// clipped to its region so it never spills into a neighbour.
     /// </summary>
+    /// <remarks>
+    /// Font sizes are device pixels, but cells arrive in content coordinates under
+    /// the camera transform. Each label rect is mapped through the canvas matrix
+    /// and painted with an identity matrix, so text stays readable at any zoom.
+    /// Cell geometry, hit testing and resize behaviour are untouched.
+    /// </remarks>
     private void DrawLabels(SKCanvas canvas, IReadOnlyList<TweenedCell> frame, RenderState state)
     {
-        foreach (TweenedCell cell in frame)
+        SKMatrix matrix = canvas.TotalMatrix;
+
+        canvas.Save();
+        canvas.ResetMatrix();
+        try
         {
-            if (cell.Alpha <= 0.05f || cell.Kind is NodeKind.FreeSpace or NodeKind.UnknownSpace)
+            foreach (TweenedCell cell in frame)
             {
-                continue;
+                if (cell.Alpha <= 0.05f)
+                {
+                    continue;
+                }
+
+                string name = NameFor(cell);
+                string size = SizeFormat.FormatBytes(SizeFormat.DisplaySize(cell.LogicalSize, cell.PhysicalSize));
+
+                if (!cell.HeaderBounds.IsEmpty)
+                {
+                    DrawHeaderLabel(canvas, state, cell, name, size, MapRect(matrix, ToSkia(cell.HeaderBounds)));
+                }
+                else
+                {
+                    DrawLeafLabel(canvas, state, cell, name, size, MapRect(matrix, ToSkia(cell.Bounds)));
+                }
             }
-
-            float minDimension = MathF.Min(cell.Bounds.Width, cell.Bounds.Height);
-            if (minDimension < 20f)
-            {
-                continue;
-            }
-
-            float available = cell.Bounds.Width - 6f;
-            if (available <= 0f)
-            {
-                continue;
-            }
-
-            SKColor fill = _palette.Resolve(cell.Kind, cell.ColorGroup, cell.Depth, cell.Alpha);
-            SKColor textColor = TreemapPalette.ContrastColor(fill);
-
-            // Start from the base size and shrink until the text fits.
-            float fontSize = Math.Clamp(state.BaseFontSize * 0.75f, state.MinFontSize, cell.Bounds.Height * 0.7f);
-            if (fontSize < state.MinFontSize)
-            {
-                continue;
-            }
-
-            string label = FitLabel(NameFor(cell), state, ref fontSize, available);
-            if (string.IsNullOrEmpty(label))
-            {
-                continue;
-            }
-
-            ConfigureFont(state, fontSize);
-
-            _font.GetFontMetrics(out SKFontMetrics metrics);
-            float baseline = cell.Bounds.Y + ((cell.Bounds.Height - (metrics.Descent - metrics.Ascent)) * 0.5f) - metrics.Ascent;
-
-            _textPaint.Color = textColor.WithAlpha((byte)(textColor.Alpha * cell.Alpha));
-            canvas.DrawText(label, cell.Bounds.X + 3f, baseline, SKTextAlign.Left, _font, _textPaint);
         }
+        finally
+        {
+            canvas.Restore();
+        }
+    }
+
+    private void DrawHeaderLabel(SKCanvas canvas, RenderState state, TweenedCell cell, string name, string size, SKRect mapped)
+    {
+        if (mapped.Height < 10f)
+        {
+            return;
+        }
+
+        float available = mapped.Width - 8f;
+        if (available <= 0f)
+        {
+            return;
+        }
+
+        if (state.BaseFontSize < state.MinFontSize)
+        {
+            return;
+        }
+
+        // Guarded before use: Math.Clamp throws when the lower bound exceeds the
+        // upper one, which a small strip or a large caller MinFontSize can cause.
+        float upper = mapped.Height * 0.75f;
+        if (upper < state.MinFontSize)
+        {
+            return;
+        }
+
+        SKColor fill = _palette.Resolve(cell.Kind, cell.ColorGroup, cell.Depth, cell.Alpha);
+        float fontSize = Math.Min(state.BaseFontSize, upper);
+
+        string label = FitLabel($"{name}  {size}", state, ref fontSize, available);
+        if (string.IsNullOrEmpty(label))
+        {
+            return;
+        }
+
+        DrawMappedText(canvas, state, label, fontSize, TreemapPalette.ContrastColor(fill),
+            cell.Alpha, mapped, x: mapped.Left + 4f, centred: false);
+    }
+
+    private void DrawLeafLabel(SKCanvas canvas, RenderState state, TweenedCell cell, string name, string size, SKRect mapped)
+    {
+        float minDimension = MathF.Min(mapped.Width, mapped.Height);
+        if (minDimension < 20f)
+        {
+            return;
+        }
+
+        float available = mapped.Width - 6f;
+        if (available <= 0f)
+        {
+            return;
+        }
+
+        if (state.BaseFontSize < state.MinFontSize)
+        {
+            return;
+        }
+
+        SKColor fill = _palette.Resolve(cell.Kind, cell.ColorGroup, cell.Depth, cell.Alpha);
+        SKColor contrast = TreemapPalette.ContrastColor(fill);
+        float centreX = mapped.Left + (mapped.Width * 0.5f);
+
+        // Two centred lines when tall enough. Name and size fit independently so
+        // a long name truncates on its own line and never suppresses the size.
+        // The lines form one compact block centred in the cell, not one line per
+        // half, so they stay adjacent in tall cells.
+        float halfHeight = mapped.Height * 0.5f;
+        float twoLineUpper = halfHeight * 0.8f;
+        if (twoLineUpper >= state.MinFontSize)
+        {
+            float nameSize = Math.Min(state.BaseFontSize, twoLineUpper);
+            float sizeSize = Math.Min(state.BaseFontSize, twoLineUpper);
+            string nameFit = FitLabel(name, state, ref nameSize, available);
+            string sizeFit = FitLabel(size, state, ref sizeSize, available);
+
+            if (!string.IsNullOrEmpty(sizeFit))
+            {
+                if (!string.IsNullOrEmpty(nameFit))
+                {
+                    DrawCompactTwoLines(canvas, state, nameFit, nameSize, sizeFit, sizeSize, contrast,
+                        cell.Alpha, mapped, centreX);
+                }
+                else
+                {
+                    DrawMappedText(canvas, state, sizeFit, sizeSize, contrast,
+                        cell.Alpha, mapped, x: centreX, centred: true);
+                }
+
+                return;
+            }
+        }
+
+        float singleUpper = mapped.Height * 0.7f;
+        if (singleUpper < state.MinFontSize)
+        {
+            return;
+        }
+
+        float fontSize = Math.Min(state.BaseFontSize, singleUpper);
+
+        string label = FitLabel($"{name}  {size}", state, ref fontSize, available);
+        if (string.IsNullOrEmpty(label))
+        {
+            return;
+        }
+
+        DrawMappedText(canvas, state, label, fontSize, contrast,
+            cell.Alpha, mapped, x: centreX, centred: true);
+    }
+
+    private void DrawMappedText(
+        SKCanvas canvas, RenderState state, string label, float fontSize, SKColor color,
+        float alpha, SKRect mapped, float x, bool centred)
+    {
+        ConfigureFont(state, fontSize);
+
+        _font.GetFontMetrics(out SKFontMetrics metrics);
+        float baseline = mapped.Top + ((mapped.Height - (metrics.Descent - metrics.Ascent)) * 0.5f) - metrics.Ascent;
+
+        canvas.Save();
+        canvas.ClipRect(mapped);
+
+        _textPaint.Color = color.WithAlpha((byte)(color.Alpha * alpha));
+        canvas.DrawText(label, x, baseline, centred ? SKTextAlign.Center : SKTextAlign.Left, _font, _textPaint);
+
+        canvas.Restore();
+    }
+
+    private void DrawCompactTwoLines(
+        SKCanvas canvas, RenderState state, string name, float nameSize,
+        string size, float sizeSize, SKColor color, float alpha,
+        SKRect mapped, float centreX)
+    {
+        ConfigureFont(state, nameSize);
+        _font.GetFontMetrics(out SKFontMetrics nameMetrics);
+        float nameHeight = nameMetrics.Descent - nameMetrics.Ascent;
+
+        ConfigureFont(state, sizeSize);
+        _font.GetFontMetrics(out SKFontMetrics sizeMetrics);
+        float sizeHeight = sizeMetrics.Descent - sizeMetrics.Ascent;
+
+        float gap = MathF.Min(4f, mapped.Height * 0.05f);
+        float total = nameHeight + gap + sizeHeight;
+        float startY = mapped.Top + ((mapped.Height - total) * 0.5f);
+
+        canvas.Save();
+        canvas.ClipRect(mapped);
+
+        _textPaint.Color = color.WithAlpha((byte)(color.Alpha * alpha));
+
+        ConfigureFont(state, nameSize);
+        canvas.DrawText(name, centreX, startY - nameMetrics.Ascent,
+            SKTextAlign.Center, _font, _textPaint);
+
+        ConfigureFont(state, sizeSize);
+        canvas.DrawText(size, centreX, startY + nameHeight + gap - sizeMetrics.Ascent,
+            SKTextAlign.Center, _font, _textPaint);
+
+        canvas.Restore();
+    }
+
+    private static SKRect MapRect(in SKMatrix matrix, SKRect rect)
+    {
+        MapPoint(matrix, rect.Left, rect.Top, out float x0, out float y0);
+        MapPoint(matrix, rect.Right, rect.Top, out float x1, out float y1);
+        MapPoint(matrix, rect.Right, rect.Bottom, out float x2, out float y2);
+        MapPoint(matrix, rect.Left, rect.Bottom, out float x3, out float y3);
+
+        return new SKRect(
+            MathF.Min(MathF.Min(x0, x1), MathF.Min(x2, x3)),
+            MathF.Min(MathF.Min(y0, y1), MathF.Min(y2, y3)),
+            MathF.Max(MathF.Max(x0, x1), MathF.Max(x2, x3)),
+            MathF.Max(MathF.Max(y0, y1), MathF.Max(y2, y3)));
+    }
+
+    private static void MapPoint(in SKMatrix matrix, float x, float y, out float mappedX, out float mappedY)
+    {
+        float w = (x * matrix.Persp0) + (y * matrix.Persp1) + matrix.Persp2;
+        float tx = (x * matrix.ScaleX) + (y * matrix.SkewX) + matrix.TransX;
+        float ty = (x * matrix.SkewY) + (y * matrix.ScaleY) + matrix.TransY;
+
+        if (w != 0f && w != 1f)
+        {
+            tx /= w;
+            ty /= w;
+        }
+
+        mappedX = tx;
+        mappedY = ty;
     }
 
     /// <summary>
@@ -317,6 +542,7 @@ public sealed class TreemapRenderer : IDisposable
         _fillPaint.Dispose();
         _borderPaint.Dispose();
         _highlightPaint.Dispose();
+        _ancestorPaint.Dispose();
         _shadowPaint.Dispose();
         _textPaint.Dispose();
         _font.Dispose();

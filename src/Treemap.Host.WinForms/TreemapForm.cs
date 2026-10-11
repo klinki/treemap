@@ -54,6 +54,15 @@ public sealed class TreemapForm : Control
     private readonly RenderState _renderState;
     private readonly SnapshotPublisher _publisher;
     private readonly System.Windows.Forms.Timer _timer;
+    private readonly ToolTip _toolTip = new()
+    {
+        AutoPopDelay = 10_000,
+        InitialDelay = 400,
+        ReshowDelay = 100,
+    };
+
+    private int _tooltipNodeId = -2;
+    private long _tooltipVersion = -1;
 
     private Bitmap? _backBuffer;
     private SKBitmap? _bitmap;
@@ -80,7 +89,13 @@ public sealed class TreemapForm : Control
         {
             MinCellSize = 2f,
             InnerPadding = 1.5f,
-            MaxDepth = 48,
+
+            // Reference style: readable top-level layers with folder headers, and
+            // the synthetic space blocks hidden until the user asks for them.
+            MaxDepth = 4,
+            ShowHeaders = true,
+            ShowFreeSpace = false,
+            ShowUnknownSpace = false,
         });
 
         _renderer = new TreemapRenderer(TreemapPalette.Default)
@@ -241,8 +256,9 @@ public sealed class TreemapForm : Control
     }
 
     /// <summary>
-    /// Applies the camera. The renderer draws in content coordinates only; without this the
-    /// treemap would always be a 1x1 unit square pinned to the top-left corner.
+    /// Applies the camera. Cell geometry draws in content coordinates; without this the
+    /// treemap would always be a 1x1 unit square pinned to the top-left corner. Labels
+    /// are mapped to device pixels inside the renderer, so they stay readable at any zoom.
     /// </summary>
     private void ApplyCamera(SKCanvas canvas)
     {
@@ -365,7 +381,11 @@ public sealed class TreemapForm : Control
             return;
         }
 
-        _controller.Relayout(animate: true);
+        // While a transition is still running, settle onto the newest snapshot
+        // without starting another tween: a live scan publishing every few hundred
+        // milliseconds would otherwise restart the animation on every preview and
+        // keep the frame timer awake for the whole scan.
+        _controller.Relayout(animate: !_controller.IsAnimating);
         Invalidate();
     }
 
@@ -445,7 +465,16 @@ public sealed class TreemapForm : Control
         else
         {
             _controller.PointerMoved(e.X, e.Y);
+            UpdateTooltip();
         }
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+
+        _controller.PointerMoved(-1, -1);
+        UpdateTooltip();
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
@@ -511,8 +540,18 @@ public sealed class TreemapForm : Control
 
         switch (e.KeyCode)
         {
+            // Back steps through navigation history; the actual parent stays on
+            // right-click, the Up key and the toolbar.
             case Keys.Back:
             case Keys.Left:
+                e.Handled = GoBack();
+                break;
+
+            case Keys.Right:
+                e.Handled = GoForward();
+                break;
+
+            case Keys.Up:
                 e.Handled = GoToParent();
                 break;
 
@@ -532,6 +571,30 @@ public sealed class TreemapForm : Control
         }
     }
 
+    /// <summary>
+    /// Refreshes the hover tooltip from the captured snapshot only: path plus
+    /// logical/allocated size, with no filesystem I/O. Rebuilt only when the
+    /// hovered node or the snapshot version changes, not on every mouse event.
+    /// </summary>
+    private void UpdateTooltip()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        int hovered = _controller.HoveredNodeId;
+        long version = _publisher.Current.Version;
+        if (hovered == _tooltipNodeId && version == _tooltipVersion)
+        {
+            return;
+        }
+
+        _tooltipNodeId = hovered;
+        _tooltipVersion = version;
+        _toolTip.SetToolTip(this, hovered >= 0 ? _controller.GetTooltipText(hovered) : string.Empty);
+    }
+
     private bool GoToParent()
     {
         if (!_controller.GoToParent())
@@ -543,10 +606,34 @@ public sealed class TreemapForm : Control
         return true;
     }
 
+    private bool GoBack()
+    {
+        if (!_controller.GoBack())
+        {
+            return false;
+        }
+
+        _controller.Relayout(animate: true);
+        return true;
+    }
+
+    private bool GoForward()
+    {
+        if (!_controller.GoForward())
+        {
+            return false;
+        }
+
+        _controller.Relayout(animate: true);
+        return true;
+    }
+
     private void GoToRoot()
     {
-        _controller.GoToRoot();
-        _controller.Relayout(animate: false);
+        if (_controller.GoToRoot())
+        {
+            _controller.Relayout(animate: false);
+        }
     }
 
     // ---- teardown ----
@@ -564,6 +651,7 @@ public sealed class TreemapForm : Control
             _timer.Tick -= OnTick;
             _timer.Dispose();
             _renderer.Dispose();
+            _toolTip.Dispose();
 
             _bitmap?.Dispose();
             _bitmap = null;

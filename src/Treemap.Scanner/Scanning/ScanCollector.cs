@@ -39,6 +39,7 @@ internal sealed class ScanCollector
     private long _directories;
     private long _logicalBytes;
     private long _physicalBytes;
+    private long _representedBytes;
     private long _hardLinkedFiles;
     private long _suppressedDiagnostics;
     private long _budgetUsed;
@@ -126,6 +127,23 @@ internal sealed class ScanCollector
             lock (_gate)
             {
                 return _physicalBytes;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sum of the per-file layout weights: the allocated size where it is known and
+    /// positive, otherwise the apparent size. This is what the treemap actually draws
+    /// for each file (see <see cref="TreemapNode.LayoutSize"/>), so it is the basis the
+    /// unaccounted-space residual is measured against.
+    /// </summary>
+    public long RepresentedBytes
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _representedBytes;
             }
         }
     }
@@ -221,6 +239,7 @@ internal sealed class ScanCollector
             _files++;
             _logicalBytes = SaturatingAdd(_logicalBytes, logicalSize);
             _physicalBytes = SaturatingAdd(_physicalBytes, physicalSize);
+            _representedBytes = SaturatingAdd(_representedBytes, physicalSize > 0 ? physicalSize : logicalSize);
 
             if (isExtraHardLinkEntry)
             {
@@ -323,6 +342,34 @@ internal sealed class ScanCollector
         progress.Report(tick);
     }
 
+    /// <summary>
+    /// One consistent picture for a preview build: the entries copied under the gate
+    /// together with the represented total for exactly those entries, so a preview never
+    /// mixes a newer total with an older entry list.
+    /// </summary>
+    public (ScanEntry[] Entries, long RepresentedBytes) CapturePreview()
+    {
+        lock (_gate)
+        {
+            return (_entries.ToArray(), _representedBytes);
+        }
+    }
+
+    /// <summary>
+    /// How many entries are held, without copying them. The preview loop reads this
+    /// first so an unchanged entry set costs no tree copy.
+    /// </summary>
+    public int EntryCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _entries.Count;
+            }
+        }
+    }
+
     /// <summary>Drops everything a failed backend collected, so a retry starts clean.</summary>
     public void Reset()
     {
@@ -334,6 +381,7 @@ internal sealed class ScanCollector
             _directories = 0;
             _logicalBytes = 0;
             _physicalBytes = 0;
+            _representedBytes = 0;
             _hardLinkedFiles = 0;
             _suppressedDiagnostics = 0;
             _budgetUsed = 0;

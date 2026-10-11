@@ -91,6 +91,9 @@ public sealed class TreemapAnimator
                 HasChildren = layout.HasChildren[i],
                 IsEntering = false,
                 ParentIndex = layout.ParentIndices[i],
+                HeaderBounds = layout.HeaderBounds[i],
+                LogicalSize = layout.LogicalSizes[i],
+                PhysicalSize = layout.PhysicalSizes[i],
             });
         }
     }

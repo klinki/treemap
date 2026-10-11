@@ -13,7 +13,7 @@ public enum NodeKind
     /// <summary>Unallocated space on the volume, rendered as a block.</summary>
     FreeSpace,
 
-    /// <summary>Space that exists but has not been scanned yet.</summary>
+    /// <summary>Used volume space not represented by scanned files, including metadata and allocation differences.</summary>
     UnknownSpace,
 
     /// <summary>Space that is neither free nor accounted for (deallocated clusters).</summary>

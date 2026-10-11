@@ -77,8 +77,17 @@ Reuse the scanner to preserve node IDs for paths present in consecutive scans.
 Scans on one instance run serially. Enumeration, tree assembly, and the optional
 `SnapshotPublisher.Publish` run on background threads. Progress uses the supplied
 `IProgress<ScanProgress>`; construct `Progress<T>` on the UI thread to marshal it.
-The scanner publishes once after enumeration, including explicitly incomplete
-results. Cancellation before publication throws and preserves the previous snapshot.
+Library calls publish once after enumeration by default, including explicitly
+incomplete results. Set `ScanOptions.PublishIntermediateSnapshots = true` to receive
+immutable previews while scanning. `SnapshotInterval` defaults to 500 ms, with a
+10 ms scheduling floor. Preview construction is serialized and skips unchanged
+entry sets. The desktop enables previews by default.
+
+With previews enabled, cancellation or failure restores the previous tree and its
+source path after draining any preview in progress. Abandoning an NTFS attempt
+discards its previews before portable enumeration starts. Without previews,
+cancellation before publication preserves the previous snapshot. A throwing final
+publication subscriber still leaves the published tree visible in this legacy mode.
 
 `FileSystemScanner.GetReadyVolumesAsync` lists ready volumes. `ScanOptions.Backend`
 can force portable enumeration. Auto tries NTFS on Windows and falls back to
@@ -106,11 +115,44 @@ its own node and full size, so totals can count shared clusters repeatedly. The
 native backend reports extra hard-link entries; portable enumeration cannot identify
 them. Windows supplies allocated sizes when available; other platforms report zero
 with a warning. Treemap layout falls back to logical size when allocation is zero,
-including resident or fully sparse data. Free space is added only for a complete
-volume-root scan. Live scans are observations over time, not atomic filesystem snapshots.
+including resident or fully sparse data. Whole-volume scans can include free and
+unaccounted space even when the result is incomplete. Folder scans include neither.
+The scanner reads total volume capacity and total free space once per scan. The
+unaccounted block is the nonnegative difference between used volume bytes and the
+sum of each file's layout weight. It can include unscanned files, inaccessible
+entries, filesystem metadata, and allocation differences. It does not measure
+access-denied files alone. Duplicate hard links can reduce this residual to zero.
+`TotalLogicalSize` and `TotalPhysicalSize` remain file totals; `FreeSpaceBytes` and
+`UnknownSpaceBytes` report the separate synthetic blocks. Live scans are observations
+over time, not atomic filesystem snapshots.
 
 See the [scanner design](docs/features/filesystem-scanner/implementation-plan.md)
 and [review evidence](docs/features/filesystem-scanner/verification.md).
+
+## Explore the map
+
+The desktop reserves folder headers above their children and shows names and sizes
+inside visible cells. Hover highlights the node and its ancestor headers. The
+tooltip shows the absolute path and logical or allocated size from the snapshot.
+
+- Double-click a folder to focus its subtree. Back and Forward restore previous
+  focus and camera positions. Up moves to the actual parent; Home returns to the
+  scan root and fits the camera.
+- Backspace or Left goes back, Right goes forward, Up or right-click goes to the
+  parent, and Home or middle-click returns home. The wheel zooms around the cursor;
+  dragging pans.
+- More detail and Less detail change visible descendant depth from 1 to 64 without
+  rescanning or changing zoom. The desktop starts at depth 4.
+- Free space and Unaccounted space independently show green and gray blocks.
+  Both start hidden. Toggling them reflows the map while preserving scan data and
+  totals.
+
+Navigation history resets when a new source is scanned. Same-source previews keep
+the current focus where it still exists. Resizing refits the camera without rebuilding
+the layout, and the frame timer stops when animation settles.
+
+See the [reference interaction plan](docs/features/reference-interactions/implementation-plan.md)
+and [verification evidence](docs/features/reference-interactions/verification.md).
 
 ## One real benchmark
 
@@ -142,29 +184,36 @@ allocations is invisible to it.
 
 ## Verification (2026-10-11)
 
-All 340 runnable tests passed in Release, including 19 hidden WinForms tests.
+All 458 runnable tests passed in Release, including 42 hidden WinForms tests.
 Five scanner tests were explicitly skipped because of platform or symbolic-link
-permissions. All 11 projects built with zero warnings and errors. Every process run
-used the bounded runner; the final test process tree peaked at 169.6 MiB committed
-memory. A small real-directory scan verified publication, stable IDs, limits,
-cancellation, and actual Windows access-denied fallback. See the
+permissions. All 11 projects built with zero warnings and errors. The final full
+test run completed in 26.4 seconds and its process tree peaked at 132.7 MiB committed
+memory. Builds, tests, and rendering fixtures used the bounded runner. Seven hidden
+window fixtures covered headers, labels, drill-down, detail levels, space blocks,
+hover, and toolbar wrapping. See the
+[reference interaction evidence](docs/features/reference-interactions/verification.md).
+
+Earlier real-directory checks verified publication, stable IDs, limits, cancellation,
+and Windows access-denied fallback. See the
 [scanner review evidence](docs/features/filesystem-scanner/verification.md) for details.
 
-The native MFT path passed record fixtures; a live native scan remains unverified
-because Windows denied the volume handle. Linux and macOS runtime checks remain
-outstanding.
+The native MFT path passed record fixtures. A live scan through an accessible NTFS
+volume, actual UAC consent, and Linux/macOS runtime checks remain unverified.
 
 Before the scanner change, one BenchmarkDotNet 0.15.8 ShortRun measurement completed
 for `Layout10K`: mean
 **1.177 ms**, standard deviation **0.0277 ms**, **1.91 MB allocated per operation**,
 three measured iterations. The 99.9% confidence interval is wide (0.671–1.682 ms);
 this is an initial measurement under the stated caps. The complete benchmark process
-tree peaked at 280.1 MiB. Other benchmark cases remain unmeasured.
+tree peaked at 280.1 MiB. Other benchmark cases remain unmeasured. No benchmark was
+rerun for the scanner or reference interaction changes.
 
 Logs are in `artifacts/verification/`; workload results are in
 `BenchmarkDotNet/results/` below that directory. Runner JSON verifies resource use;
 BenchmarkDotNet workload samples establish that the benchmark actually ran.
 
-Known limits: publishing again during an active tween restarts from its previous
-target and can jump. When retained nodes reverse ancestor relationships, a single
-prepared draw order follows the target hierarchy.
+Live previews received during an active tween snap to the newest layout. Other
+interrupted transitions can still jump from the previous target. The camera keeps
+the square layout's aspect ratio, leaving margins in wide windows. When retained
+nodes reverse ancestor relationships, the prepared draw order follows the target
+hierarchy.

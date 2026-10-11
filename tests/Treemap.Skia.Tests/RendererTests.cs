@@ -313,9 +313,291 @@ public class RendererTests
         return seen.Count;
     }
 
+    // ---- reference interactions ----
+
+    [Fact]
+    public void SpaceColorsFollowTheReference()
+    {
+        TreemapPalette palette = TreemapPalette.Default;
+
+        SKColor free = palette.Resolve(NodeKind.FreeSpace, 0, 1);
+        Assert.True(free.Green > free.Red && free.Green > free.Blue, "free space must read green");
+
+        SKColor unknown = palette.Resolve(NodeKind.UnknownSpace, 0, 1);
+        Assert.Equal(unknown.Red, unknown.Green);
+        Assert.Equal(unknown.Green, unknown.Blue);
+    }
+
+    [Fact]
+    public void HeadersReserveAStripAboveChildren()
+    {
+        TreemapNode tree = TreeBuilderLike.Folder();
+        LayoutResult headed = SquarifyLayout.Compute(
+            tree, new RectF(0, 0, 400, 300), new LayoutOptions { ShowHeaders = true });
+
+        Assert.True(headed.TryGetIndex(9, out int folder));
+        Assert.False(headed.HeaderBounds[folder].IsEmpty);
+
+        using SKBitmap bitmap = new(400, 300);
+        using SKCanvas canvas = new(bitmap);
+        using TreemapRenderer renderer = new();
+        renderer.DrawLayout(canvas, headed, new RenderState());
+
+        Assert.True(CountDistinct(bitmap) > 3);
+    }
+
+    [Fact]
+    public void HoverBrightensTheCellAndShadesAncestorHeadersOnly()
+    {
+        RectF ancestorHeader = new(0, 0, 120, 22);
+        List<TweenedCell> frame =
+        [
+            FrameCell(1, new RectF(0, 0, 120, 120), depth: 0, parent: -1, header: ancestorHeader),
+            FrameCell(2, new RectF(40, 40, 40, 40), depth: 1, parent: 0),
+        ];
+
+        using TreemapRenderer renderer = new();
+        using SKBitmap plain = RenderFrame(renderer, frame, hoveredNodeId: -1, size: 160);
+        using SKBitmap hovered = RenderFrame(renderer, frame, hoveredNodeId: 2, size: 160);
+
+        // Ancestor header strip is shaded.
+        Assert.NotEqual(plain.GetPixel(60, 11), hovered.GetPixel(60, 11));
+
+        // Hovered interior is brightened.
+        Assert.NotEqual(plain.GetPixel(60, 60), hovered.GetPixel(60, 60));
+
+        // Ancestor interior outside the header and the child keeps its fill.
+        Assert.Equal(plain.GetPixel(10, 60), hovered.GetPixel(10, 60));
+    }
+
+    [Fact]
+    public void HoverLeavesUnrelatedLeavesUntouched()
+    {
+        List<TweenedCell> frame =
+        [
+            FrameCell(1, new RectF(0, 0, 240, 120), depth: 0, parent: -1, header: new RectF(0, 0, 240, 22)),
+            FrameCell(2, new RectF(0, 22, 120, 98), depth: 1, parent: 0, header: new RectF(0, 22, 120, 22)),
+            FrameCell(3, new RectF(40, 60, 40, 40), depth: 2, parent: 1),
+            FrameCell(4, new RectF(120, 22, 120, 98), depth: 1, parent: 0),
+        ];
+
+        using TreemapRenderer renderer = new();
+        using SKBitmap plain = RenderFrame(renderer, frame, hoveredNodeId: -1, size: 260);
+        using SKBitmap hovered = RenderFrame(renderer, frame, hoveredNodeId: 3, size: 260);
+
+        // Chain headers and the hovered cell change.
+        Assert.NotEqual(plain.GetPixel(60, 33), hovered.GetPixel(60, 33));
+        Assert.NotEqual(plain.GetPixel(120, 11), hovered.GetPixel(120, 11));
+        Assert.NotEqual(plain.GetPixel(60, 80), hovered.GetPixel(60, 80));
+
+        // Unrelated leaf interior, clear of outlines, is untouched.
+        Assert.Equal(plain.GetPixel(180, 70), hovered.GetPixel(180, 70));
+    }
+
+    [Fact]
+    public void HoverShadowDoesNotDarkenTheHoveredInterior()
+    {
+        List<TweenedCell> frame =
+        [
+            FrameCell(1, new RectF(20, 20, 80, 80), depth: 1, parent: -1),
+        ];
+
+        using TreemapRenderer renderer = new();
+        using SKBitmap plain = RenderFrame(renderer, frame, hoveredNodeId: -1, size: 140, shadow: true);
+        using SKBitmap hovered = RenderFrame(renderer, frame, hoveredNodeId: 1, size: 140, shadow: true);
+
+        SKColor before = plain.GetPixel(60, 60);
+        SKColor after = hovered.GetPixel(60, 60);
+
+        Assert.True(after.Red >= before.Red, $"red darkened: {before.Red} -> {after.Red}");
+        Assert.True(after.Green >= before.Green, $"green darkened: {before.Green} -> {after.Green}");
+        Assert.True(after.Blue >= before.Blue, $"blue darkened: {before.Blue} -> {after.Blue}");
+        Assert.True(
+            (after.Red + after.Green + after.Blue) > (before.Red + before.Green + before.Blue),
+            "hovered interior must be brighter, not shadowed");
+    }
+
+    [Fact]
+    public void LabelsPaintInDevicePixelsUnderScaleWithoutLeakingState()
+    {
+        TweenedCell cell = new()
+        {
+            NodeId = 10,
+            Bounds = new RectF(0, 0, 400, 300),
+            Alpha = 1f,
+            Depth = 1,
+            Kind = NodeKind.File,
+            ColorGroup = 1,
+            AreaFraction = 1f,
+            HasChildren = false,
+            IsEntering = false,
+            ParentIndex = -1,
+            HeaderBounds = default,
+            LogicalSize = 5000,
+            PhysicalSize = 5000,
+        };
+        IReadOnlyList<TweenedCell> frame = [cell];
+
+        using TreemapRenderer renderer = new();
+        renderer.NameResolver = _ => "a.dll";
+
+        using SKBitmap withLabels = new(400, 300);
+        SKMatrix matrixBefore;
+        SKMatrix matrixAfter;
+        using (SKCanvas canvas = new(withLabels))
+        {
+            canvas.Clear(SKColors.Black);
+            canvas.Scale(0.5f);
+            matrixBefore = canvas.TotalMatrix;
+            renderer.Draw(canvas, frame, new RenderState { ShowLabels = true });
+            matrixAfter = canvas.TotalMatrix;
+
+            // No clip leakage: a full-content rect must still reach the corner.
+            using SKPaint white = new() { Color = SKColors.White };
+            canvas.DrawRect(new SKRect(0, 0, 800, 600), white);
+        }
+
+        Assert.Equal(matrixBefore.ScaleX, matrixAfter.ScaleX, precision: 4);
+        Assert.Equal(matrixBefore.ScaleY, matrixAfter.ScaleY, precision: 4);
+        Assert.Equal(matrixBefore.TransX, matrixAfter.TransX, precision: 3);
+        Assert.Equal(SKColors.White, withLabels.GetPixel(399, 299));
+
+        // Separate pair without the whitewash for the visibility check.
+        using SKBitmap labelled = new(400, 300);
+        using (SKCanvas canvas = new(labelled))
+        {
+            canvas.Clear(SKColors.Black);
+            canvas.Scale(0.5f);
+            renderer.Draw(canvas, frame, new RenderState { ShowLabels = true });
+        }
+
+        using SKBitmap plain = new(400, 300);
+        using (SKCanvas canvas = new(plain))
+        {
+            canvas.Clear(SKColors.Black);
+            canvas.Scale(0.5f);
+            renderer.Draw(canvas, frame, new RenderState { ShowLabels = false });
+        }
+
+        // Content (0,0,400,300) at half scale maps to device (0,0,200,150).
+        int differing = 0;
+        for (int y = 0; y < 300; y++)
+        {
+            for (int x = 0; x < 400; x++)
+            {
+                if (labelled.GetPixel(x, y) != plain.GetPixel(x, y))
+                {
+                    differing++;
+                    Assert.True(x <= 201 && y <= 151, $"label paint leaked outside the mapped cell at ({x},{y})");
+                }
+            }
+        }
+
+        Assert.True(differing > 0, "scaled label should still paint at readable device size");
+    }
+
+    [Fact]
+    public void LongLeafNameKeepsSizeLineVisibleWithinScaledCell()
+    {
+        TweenedCell cell = new()
+        {
+            NodeId = 10,
+            Bounds = new RectF(0, 0, 400, 300),
+            Alpha = 1f,
+            Depth = 1,
+            Kind = NodeKind.File,
+            ColorGroup = 1,
+            AreaFraction = 1f,
+            HasChildren = false,
+            IsEntering = false,
+            ParentIndex = -1,
+            HeaderBounds = default,
+            LogicalSize = 5000,
+            PhysicalSize = 5000,
+        };
+        IReadOnlyList<TweenedCell> frame = [cell];
+
+        using TreemapRenderer renderer = new();
+        renderer.NameResolver = _ => new string('w', 200);
+
+        using SKBitmap labelled = new(400, 300);
+        using (SKCanvas canvas = new(labelled))
+        {
+            canvas.Clear(SKColors.Black);
+            canvas.Scale(0.5f);
+            renderer.Draw(canvas, frame, new RenderState { ShowLabels = true });
+        }
+
+        using SKBitmap plain = new(400, 300);
+        using (SKCanvas canvas = new(plain))
+        {
+            canvas.Clear(SKColors.Black);
+            canvas.Scale(0.5f);
+            renderer.Draw(canvas, frame, new RenderState { ShowLabels = false });
+        }
+
+        // Content (0,0,400,300) at half scale maps to device (0,0,200,150),
+        // centre (100,75). The two lines form one compact block around the
+        // centre, so both the name (above) and the size (below) paint near it.
+        int aboveCentre = 0;
+        int belowCentre = 0;
+        for (int y = 0; y < 300; y++)
+        {
+            for (int x = 0; x < 400; x++)
+            {
+                if (labelled.GetPixel(x, y) != plain.GetPixel(x, y))
+                {
+                    Assert.True(x <= 201 && y <= 151, $"label paint leaked outside the mapped cell at ({x},{y})");
+                    if (y >= 45 && y < 75)
+                    {
+                        aboveCentre++;
+                    }
+                    else if (y >= 75 && y <= 105)
+                    {
+                        belowCentre++;
+                    }
+                }
+            }
+        }
+
+        Assert.True(aboveCentre > 0, "the name line should paint just above the cell centre");
+        Assert.True(belowCentre > 0, "a long leaf name must not suppress the size line near the centre");
+    }
+
+    [Fact]
+    public void ExtremeFontSizesCullSafelyInsteadOfThrowing()
+    {
+        List<TweenedCell> frame =
+        [
+            FrameCell(1, new RectF(0, 0, 60, 30), depth: 0, parent: -1, header: new RectF(0, 0, 60, 10)),
+            FrameCell(2, new RectF(70, 0, 30, 24), depth: 1, parent: 0),
+        ];
+
+        using TreemapRenderer renderer = new();
+        renderer.NameResolver = _ => "name";
+
+        using SKBitmap bitmap = new(120, 120);
+        using SKCanvas canvas = new(bitmap);
+
+        Exception? thrown = Record.Exception(() => renderer.Draw(
+            canvas, frame, new RenderState { MinFontSize = 20f, BaseFontSize = 24f }));
+
+        Assert.Null(thrown);
+    }
+
+    private static class TreeBuilderLike
+    {
+        public static TreemapNode Folder()
+            => TreemapNode.Create(9, "inner", NodeKind.Folder, 0, 0, null, 0,
+            [
+                TreemapNode.Create(10, "a.dll", NodeKind.File, 5_000, 5_000, null, 1),
+                TreemapNode.Create(11, "b.dll", NodeKind.File, 3_000, 3_000, null, 2),
+            ]);
+    }
+
     // ---- hover ancestry ----
 
-    private static TweenedCell FrameCell(int id, RectF bounds, int depth, int parent)
+    private static TweenedCell FrameCell(int id, RectF bounds, int depth, int parent, RectF header = default)
         => new()
         {
             NodeId = id,
@@ -328,6 +610,7 @@ public class RendererTests
             HasChildren = true,
             IsEntering = false,
             ParentIndex = parent,
+            HeaderBounds = header,
         };
 
     private static int IndexOfFrame(IReadOnlyList<TweenedCell> frame, int nodeId)

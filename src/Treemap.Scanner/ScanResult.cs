@@ -11,9 +11,13 @@ namespace Treemap.Scanning;
 ///
 /// <para>
 /// <b>Sizes.</b> <see cref="TotalLogicalSize"/> sums apparent file lengths,
-/// <see cref="TotalPhysicalSize"/> sums allocated sizes. The latter is 0 where allocation
-    /// is unavailable; <see cref="TreemapNode.LayoutSize"/> falls back to logical size for
-    /// zero allocation, including resident or fully sparse files.
+/// <see cref="TotalPhysicalSize"/> sums allocated sizes. Both are file totals: the
+/// synthetic free-space and unaccounted-space blocks report through
+/// <see cref="FreeSpaceBytes"/> and <see cref="UnknownSpaceBytes"/> instead, so
+/// toggling their display never changes what the scan measured.
+/// <see cref="TotalPhysicalSize"/> is 0 where allocation is unavailable;
+/// <see cref="TreemapNode.LayoutSize"/> falls back to logical size for zero
+/// allocation, including resident or fully sparse files.
 /// </para>
 ///
 /// <para>
@@ -70,8 +74,25 @@ public sealed record ScanResult
     /// <summary>Sum of allocated sizes across all nodes, or 0 when allocation is unavailable.</summary>
     public long TotalPhysicalSize { get; init; }
 
-    /// <summary>Free-space node added for a complete volume-root scan, or 0.</summary>
+    /// <summary>Free-space node added for a volume-root scan, or 0.</summary>
+    /// <remarks>
+    /// A point-in-time reading, attached to complete and incomplete volume scans alike.
+    /// Never file content: it joins the root's physical total only, while
+    /// <see cref="TotalLogicalSize"/> and <see cref="TotalPhysicalSize"/> stay file-only.
+    /// </remarks>
     public long FreeSpaceBytes { get; init; }
+
+    /// <summary>Unaccounted-space node added for a volume-root scan, or 0.</summary>
+    /// <remarks>
+    /// A safe nonnegative residual: used volume bytes minus the represented file
+    /// allocation (falling back to apparent size where allocation is unknown),
+    /// clamped at zero when duplicated hard links overcount. It covers metadata and
+    /// allocation differences as well as files the scan could not read, so it is
+    /// reported as "Unaccounted space" rather than as inaccessible files. Like
+    /// <see cref="FreeSpaceBytes"/> it joins the root's physical total only and leaves
+    /// the file totals alone.
+    /// </remarks>
+    public long UnknownSpaceBytes { get; init; }
 
     /// <summary>
     /// Extra nodes produced by hard links: a file linked into N directories contributes N

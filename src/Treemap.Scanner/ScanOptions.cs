@@ -85,6 +85,35 @@ public sealed record ScanOptions
     public bool IncludeFreeSpace { get; init; } = true;
 
     /// <summary>
+    /// Add an "Unaccounted space" block to a volume-root scan, like
+    /// <see cref="IncludeFreeSpace"/> but for the other side of the ledger: the used
+    /// bytes no scanned file accounts for. The residual also covers metadata and
+    /// allocation differences, not just files the scan could not read, which is why it
+    /// is not called inaccessible space. Ignored for any other root.
+    /// </summary>
+    public bool IncludeUnknownSpace { get; init; } = true;
+
+    /// <summary>
+    /// Publish work-in-progress trees to the publisher while the scan is still running.
+    /// Defaults to false: a library caller gets exactly one publish, the finished tree.
+    /// The desktop host opts in for its live map.
+    /// </summary>
+    public bool PublishIntermediateSnapshots { get; init; }
+
+    /// <summary>
+    /// Minimum gap between intermediate snapshot builds. Separate from
+    /// <see cref="ProgressInterval"/>: progress ticks are cheap records, previews rebuild
+    /// the tree. Below 10 ms the timer is still armed with a 10 ms delay, so a zero or
+    /// submillisecond interval cannot spin a pool thread; tests use zero on tiny
+    /// backends only, and hosts should not. Above <see cref="MaxSnapshotInterval"/> the
+    /// value is rejected, because <see cref="Timer"/> cannot arm it.
+    /// </summary>
+    public TimeSpan SnapshotInterval { get; init; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>Largest gap the preview timer supports: the <see cref="Timer"/> due-time bound.</summary>
+    public static readonly TimeSpan MaxSnapshotInterval = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
+    /// <summary>
     /// Minimum gap between progress reports. <see cref="TimeSpan.Zero"/> reports on every
     /// entry, which tests use and hosts should not.
     /// </summary>
@@ -127,6 +156,17 @@ public sealed record ScanOptions
         if (ProgressInterval < TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(ProgressInterval), ProgressInterval, "Must not be negative.");
+        }
+
+        if (SnapshotInterval < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(SnapshotInterval), SnapshotInterval, "Must not be negative.");
+        }
+
+        if (SnapshotInterval > MaxSnapshotInterval)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(SnapshotInterval), SnapshotInterval, $"Must not exceed {MaxSnapshotInterval}.");
         }
 
         return this;

@@ -159,6 +159,9 @@ public sealed class LayoutTween
                     HasChildren = _from.HasChildren[source],
                     IsEntering = false,
                     ParentIndex = entry.ParentFrameIndex,
+                    HeaderBounds = _from.HeaderBounds[source],
+                    LogicalSize = _from.LogicalSizes[source],
+                    PhysicalSize = _from.PhysicalSizes[source],
                 });
             }
             else if (entry.IsEntering)
@@ -177,17 +180,23 @@ public sealed class LayoutTween
                     HasChildren = _to.HasChildren[target],
                     IsEntering = true,
                     ParentIndex = entry.ParentFrameIndex,
+                    HeaderBounds = _to.HeaderBounds[target],
+                    LogicalSize = _to.LogicalSizes[target],
+                    PhysicalSize = _to.PhysicalSizes[target],
                 });
             }
             else
             {
-                // In both layouts: interpolate towards the target rect.
+                // In both layouts: interpolate towards the target rect. The header
+                // follows the interpolated bounds so it stays inside the cell at
+                // every intermediate t, even when one endpoint has none.
                 int source = entry.FromIndex;
                 int target = entry.ToIndex;
+                RectF bounds = RectF.Lerp(_from.Bounds[source], _to.Bounds[target], t);
                 output.Add(new TweenedCell
                 {
                     NodeId = entry.NodeId,
-                    Bounds = RectF.Lerp(_from.Bounds[source], _to.Bounds[target], t),
+                    Bounds = bounds,
                     Alpha = 1f,
                     Depth = entry.Depth,
                     Kind = _to.Kinds[target],
@@ -196,9 +205,43 @@ public sealed class LayoutTween
                     HasChildren = _to.HasChildren[target],
                     IsEntering = false,
                     ParentIndex = entry.ParentFrameIndex,
+                    HeaderBounds = LerpHeader(_from.HeaderBounds[source], _to.HeaderBounds[target], bounds, t),
+                    LogicalSize = _to.LogicalSizes[target],
+                    PhysicalSize = _to.PhysicalSizes[target],
                 });
             }
         }
+    }
+
+    /// <summary>
+    /// Interpolates header strips while keeping the result inside the current
+    /// <paramref name="bounds"/>. Both endpoints present lerps directly; a missing
+    /// endpoint grows or shrinks a top strip anchored to the current cell, so an
+    /// empty rect at the global origin never drags the label off-cell mid-tween.
+    /// </summary>
+    private static RectF LerpHeader(in RectF from, in RectF to, in RectF bounds, float t)
+    {
+        bool fromEmpty = from.IsEmpty;
+        bool toEmpty = to.IsEmpty;
+
+        if (!fromEmpty && !toEmpty)
+        {
+            return RectF.Lerp(from, to, t);
+        }
+
+        if (fromEmpty && toEmpty)
+        {
+            return RectF.Empty;
+        }
+
+        float height = fromEmpty ? to.Height * t : from.Height * (1f - t);
+        if (height <= 0f || bounds.IsEmpty)
+        {
+            return RectF.Empty;
+        }
+
+        height = MathF.Min(height, bounds.Height);
+        return new RectF(bounds.X, bounds.Y, bounds.Width, height);
     }
 
     /// <summary>
@@ -378,4 +421,13 @@ public readonly struct TweenedCell
     /// its parent is animating towards.
     /// </summary>
     public required int ParentIndex { get; init; }
+
+    /// <summary>Header strip for folder cells, or empty for leaves and collapsed nodes.</summary>
+    public RectF HeaderBounds { get; init; }
+
+    /// <summary>Apparent size in bytes, for labels and tooltips.</summary>
+    public long LogicalSize { get; init; }
+
+    /// <summary>Allocated size in bytes, for labels and tooltips.</summary>
+    public long PhysicalSize { get; init; }
 }
