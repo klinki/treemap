@@ -175,11 +175,10 @@ public sealed class FileSystemScanner
         CancellationToken cancellationToken)
     {
         Stopwatch clock = Stopwatch.StartNew();
-        ScanCollector collector = new(options, progress);
-
         // One spelling for the whole scan, so a trailing separator cannot change the
         // reported root, the free-space check or the tree the caller gets back.
         string fullRootPath = ScanPath.Normalize(rootPath);
+        ScanCollector collector = new(options, progress, fullRootPath.Length);
         ScanRequest request = new(fullRootPath, options, cancellationToken);
 
         IScanBackend portable = _portableOverride ?? new PortableScanBackend();
@@ -231,11 +230,12 @@ public sealed class FileSystemScanner
         collector.Report(ScanPhase.Starting, fullRootPath, force: true);
         cancellationToken.ThrowIfCancellationRequested();
 
-        // One identity transaction for the whole scan, opened before any backend runs:
-        // previews reserve from the same pending map the final tree builds from, so an
-        // id seen in a preview is the id the final tree and the next rescan use. Only
-        // a finished scan commits; anything else aborts and keeps the last good map.
-        _ids.BeginBuild();
+        // One identity transaction for the whole scan, scoped to this root and opened
+        // before any backend runs: previews reserve from the same pending map the
+        // final tree builds from, so an id seen in a preview is the id the final tree
+        // and the next rescan use. Only a finished scan commits; anything else aborts
+        // and keeps the last good map.
+        _ids.BeginBuild(fullRootPath);
 
         PreviewLoop? previews = null;
         TreemapSnapshot? snapshot = null;
@@ -263,29 +263,36 @@ public sealed class FileSystemScanner
                 {
                     abandoned = ScanBackend.NtfsMft;
                     fallbackReason = "The NTFS MFT backend is only available on Windows.";
-                }
-                else if (fast.TryRun(request, collector, out string? reason))
-                {
-                    backend = fast.Id;
-                    needPortableScan = false;
+                    collector.SetBackend(null, abandoned, fallbackReason);
                 }
                 else
                 {
-                    // Whatever the fast backend collected is worthless now - it may be a partial
-                    // walk of a volume we have decided not to trust. The reset, the
-                    // identity restart and the restore run under the preview gate, so
-                    // an in-flight preview cannot capture abandoned entries after they
-                    // are dropped, reserve their ids again, or publish over the
-                    // restored map.
-                    abandoned = fast.Id;
-                    fallbackReason = reason;
-                    if (previews is not null)
+                    collector.SetBackend(fast.Id, null, null);
+                    collector.Report(ScanPhase.Starting, fullRootPath, force: true);
+                    if (fast.TryRun(request, collector, out string? reason))
                     {
-                        previews.AbandonAndRestore(collector);
+                        backend = fast.Id;
+                        needPortableScan = false;
                     }
                     else
                     {
-                        collector.Reset();
+                        // Whatever the fast backend collected is worthless now - it may be a partial
+                        // walk of a volume we have decided not to trust. The reset, the
+                        // identity restart and the restore run under the preview gate, so
+                        // an in-flight preview cannot capture abandoned entries after they
+                        // are dropped, reserve their ids again, or publish over the
+                        // restored map.
+                        abandoned = fast.Id;
+                        fallbackReason = reason;
+                        collector.SetBackend(fast.Id, abandoned, fallbackReason);
+                        if (previews is not null)
+                        {
+                            previews.AbandonAndRestore(collector);
+                        }
+                        else
+                        {
+                            collector.Reset();
+                        }
                     }
                 }
             }
@@ -296,6 +303,7 @@ public sealed class FileSystemScanner
 
             if (needPortableScan)
             {
+                collector.SetBackend(ScanBackend.Portable, abandoned, fallbackReason);
                 collector.Report(ScanPhase.Enumerating, fullRootPath, force: true);
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -341,7 +349,7 @@ public sealed class FileSystemScanner
                 else
                 {
                     root = AddVolumeSpace(
-                        root, fullRootPath, space, collector.RepresentedBytes, options, _ids,
+                        root, space, collector.RepresentedBytes, options, _ids,
                         out freeSpace, out unknownSpace);
                 }
             }
@@ -428,7 +436,6 @@ public sealed class FileSystemScanner
     /// </summary>
     private static TreemapNode AddVolumeSpace(
         TreemapNode root,
-        string fullRootPath,
         VolumeSpaceInfo space,
         long representedBytes,
         ScanOptions options,
@@ -471,7 +478,7 @@ public sealed class FileSystemScanner
         if (freeSpace > 0)
         {
             children[at++] = TreemapNode.Create(
-                ids.ReserveFreeSpace(fullRootPath),
+                ids.ReserveFreeSpaceScoped(),
                 "Free space",
                 NodeKind.FreeSpace,
                 freeSpace,
@@ -481,7 +488,7 @@ public sealed class FileSystemScanner
         if (unknownSpace > 0)
         {
             children[at++] = TreemapNode.Create(
-                ids.ReserveUnknownSpace(fullRootPath),
+                ids.ReserveUnknownSpaceScoped(),
                 "Unaccounted space",
                 NodeKind.UnknownSpace,
                 unknownSpace,
@@ -690,7 +697,7 @@ public sealed class FileSystemScanner
             TreemapNode empty = ScanTreeBuilder.Build(
                 _fullRootPath, Array.Empty<ScanEntry>(), _ids, _cancellationToken);
             TreemapNode withSpace = AddVolumeSpace(
-                empty, _fullRootPath, space, 0, _options, _ids,
+                empty, space, 0, _options, _ids,
                 out long freeSpace, out long unknownSpace);
 
             if (freeSpace <= 0 && unknownSpace <= 0)
@@ -796,7 +803,7 @@ public sealed class FileSystemScanner
                 // returned trees carry over, so a path seen only in the discarded
                 // preview gets a fresh id if a later scan shows it again, while
                 // paths in the last accepted tree keep their committed ids.
-                _ids.BeginBuild();
+                _ids.BeginBuild(_fullRootPath);
 
                 // Same basis the scan opened with. On the scanning thread, so a
                 // throwing subscriber propagates to the scan's catch, which restores
@@ -878,7 +885,7 @@ public sealed class FileSystemScanner
                     if (space is not null)
                     {
                         root = AddVolumeSpace(
-                            root, _fullRootPath, space, represented, _options, _ids,
+                            root, space, represented, _options, _ids,
                             out _, out _);
                     }
                 }

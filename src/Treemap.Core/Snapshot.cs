@@ -34,8 +34,10 @@ public sealed class TreemapSnapshot
         Timestamp = timestamp;
         RootPath = rootPath;
 
-        Dictionary<int, TreemapNode> map = new(256);
-        Dictionary<int, int> parents = new(256);
+        // Pre-size both maps from a counting pass to avoid resize array overlap.
+        int count = CountNodes(root);
+        Dictionary<int, TreemapNode> map = new(count);
+        Dictionary<int, int> parents = new(count);
         Index(map, parents, root, parentId: -1);
         _nodesById = map;
         _parentById = parents;
@@ -109,6 +111,25 @@ public sealed class TreemapSnapshot
     /// <summary>Builds a snapshot with a fresh version number.</summary>
     public static TreemapSnapshot Create(TreemapNode root, long version, string? rootPath = null)
         => new(root, version, DateTimeOffset.UtcNow, rootPath);
+
+    /// <summary>
+    /// Counts nodes so the lookup dictionaries can be pre-sized.
+    /// Duplicate ids count once per visit: slight over-sizing is harmless.
+    /// </summary>
+    private static int CountNodes(TreemapNode node)
+    {
+        int count = 1;
+        checked
+        {
+            IReadOnlyList<TreemapNode> children = node.Children;
+            for (int i = 0; i < children.Count; i++)
+            {
+                count += CountNodes(children[i]);
+            }
+        }
+
+        return count;
+    }
 
     private static void Index(
         Dictionary<int, TreemapNode> map, Dictionary<int, int> parents, TreemapNode node, int parentId)

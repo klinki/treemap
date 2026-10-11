@@ -59,7 +59,7 @@ public class ScanTreeBuilderTests
         string volumeRoot = Path.GetPathRoot(Path.GetFullPath(Path.GetTempPath()))!;
 
         ScanIdMap ids = new();
-        ids.BeginBuild();
+        ids.BeginBuild(volumeRoot);
         TreemapNode root = ScanTreeBuilder.Build(
             volumeRoot,
             [new ScanEntry("windows", NodeKind.Folder, 0, 0, null)],
@@ -164,8 +164,9 @@ public class ScanTreeBuilderTests
     private static TreemapNode Build(params ScanEntry[] entries)
     {
         ScanIdMap ids = new();
-        ids.BeginBuild();
-        return ScanTreeBuilder.Build(Path.Combine(Path.GetTempPath(), "builder"), entries, ids, CancellationToken.None);
+        string root = Path.Combine(Path.GetTempPath(), "builder");
+        ids.BeginBuild(root);
+        return ScanTreeBuilder.Build(root, entries, ids, CancellationToken.None);
     }
 }
 
@@ -246,6 +247,31 @@ public class ScanIdMapTests
     {
         ScanIdMap map = new();
         Assert.Throws<InvalidOperationException>(() => map.Reserve("/tree/alpha"));
+    }
+
+    [Fact]
+    public void SwitchingModesDiscardsThePendingBuild()
+    {
+        ScanIdMap map = new();
+        string root = Path.Combine(Path.GetTempPath(), "treemap-switch-" + Guid.NewGuid().ToString("N")[..8]);
+
+        map.BeginBuild();
+        int legacy = map.Reserve("/tree/alpha");
+
+        // Opening a scoped build drops the legacy pending one: its reservation is gone
+        // and the legacy entry point no longer applies.
+        map.BeginBuild(root);
+        Assert.Throws<InvalidOperationException>(() => map.Reserve("/tree/alpha"));
+        int scoped = map.ReserveRelative("alpha.txt");
+        map.Commit();
+
+        // The commit promoted the scoped map only.
+        map.BeginBuild(root);
+        Assert.Equal(scoped, map.ReserveRelative("alpha.txt"));
+
+        map.BeginBuild();
+        Assert.Throws<InvalidOperationException>(() => map.ReserveRelative("alpha.txt"));
+        Assert.NotEqual(legacy, map.Reserve("/tree/alpha"));
     }
 
     [Fact]

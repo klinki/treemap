@@ -609,6 +609,33 @@ public class NtfsMftScanBackendTests
         Assert.True(result.TotalLogicalSize > 0);
     }
 
+    [Theory]
+    [InlineData(512)]
+    [InlineData(1300)]
+    public void DirectoryMapMemoryLimitDeclinesBeforeEmittingEntries(long bytes)
+    {
+        ScanOptions options = ScanOptions.Default with { MemoryBudgetBytes = bytes };
+        ScanCollector collector = Collector(options);
+
+        Assert.False(Backend(Volume()).TryRun(Request(ScanRootPath, options), collector, out string? reason));
+        Assert.Contains("memory budget", reason!, StringComparison.Ordinal);
+        Assert.Empty(collector.Entries);
+        Assert.False(collector.IsComplete);
+    }
+
+    [Fact]
+    public void EntryPassMemoryLimitReturnsAcceptedDataInsteadOfDeclining()
+    {
+        ScanOptions options = ScanOptions.Default with { MemoryBudgetBytes = 4096 };
+        ScanCollector collector = Collector(options);
+
+        Assert.True(Backend(Volume()).TryRun(Request(VolumeRootPath, options), collector, out string? reason), reason);
+        Assert.Null(reason);
+        Assert.NotEmpty(collector.Entries);
+        Assert.False(collector.IsComplete);
+        Assert.Contains("memory budget", collector.IncompleteReason!, StringComparison.Ordinal);
+    }
+
     private static NtfsMftScanBackend Backend(FixtureRecordSource source, NtfsSizeQuery? query = null)
         => new(_ => source, query ?? ThrowingQuery());
 

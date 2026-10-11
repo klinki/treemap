@@ -90,7 +90,7 @@ internal sealed class NtfsMftScanBackend : IScanBackend
 
         using (source)
         {
-            NtfsDirectoryMap map = new(request.Options.MaxEntries);
+            NtfsDirectoryMap map = new(request.Options.MaxEntries, collector);
             DirectoryVisitor directories = new(map, cancellationToken);
 
             if (!MftRecordStream.TryWalk(source, cancellationToken, collector, request.RootPath, directories, out failureReason))
@@ -102,7 +102,9 @@ internal sealed class NtfsMftScanBackend : IScanBackend
 
             if (directories.MapFull)
             {
-                failureReason = $"The volume holds more directories than the {request.Options.MaxEntries}-entry budget allows.";
+                failureReason = map.MemoryLimitReached
+                    ? "The NTFS directory map exceeded the scan memory budget."
+                    : $"The volume holds more directories than the {request.Options.MaxEntries}-entry budget allows.";
                 return false;
             }
 
@@ -112,7 +114,15 @@ internal sealed class NtfsMftScanBackend : IScanBackend
                 return false;
             }
 
-            ReportExclusions(request, map.MarkSubtree(rootOrdinal, request.Options, cancellationToken), collector);
+            NtfsDirectoryMap.Exclusions exclusions = map.MarkSubtree(rootOrdinal, request.Options, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (map.MemoryLimitReached)
+            {
+                failureReason = "The NTFS directory map exceeded the scan memory budget.";
+                return false;
+            }
+
+            ReportExclusions(request, exclusions, collector);
 
             cancellationToken.ThrowIfCancellationRequested();
 

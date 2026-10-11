@@ -76,12 +76,14 @@ internal sealed class NtfsDirectoryMap
     private readonly Dictionary<ulong, Node> _directories = [];
     private readonly List<Node> _all = [];
     private readonly long _limit;
+    private readonly ScanCollector? _collector;
     private Dictionary<ulong, List<Node>>? _children;
     private bool _volumeRootRead;
 
-    public NtfsDirectoryMap(long limit)
+    public NtfsDirectoryMap(long limit, ScanCollector? collector = null)
     {
         _limit = limit;
+        _collector = collector;
 
         // A place for the volume root so a path can be resolved as the walk proceeds. It
         // starts unpopulated: nothing may be built on record 5 until record 5 has actually
@@ -103,15 +105,27 @@ internal sealed class NtfsDirectoryMap
     /// <summary>Directories retained, for the fallback reason when the map fills up.</summary>
     public int Count => _all.Count;
 
+    public bool MemoryLimitReached { get; private set; }
+
     /// <summary>
     /// Records one directory under the one name it carries. Returns false once the map is
     /// full, which the backend turns into a fallback rather than a partial directory set.
     /// </summary>
     public bool TryAdd(MftRecordInfo record, MftName name)
     {
+        if (MemoryLimitReached)
+        {
+            return false;
+        }
+
         if (!_directories.TryGetValue(record.Ordinal, out Node? node))
         {
             if (_all.Count >= _limit)
+            {
+                return false;
+            }
+
+            if (!ReserveMemory(512L + (2L * name.Name.Length)))
             {
                 return false;
             }
@@ -257,6 +271,12 @@ internal sealed class NtfsDirectoryMap
                     continue;
                 }
 
+                long pathLength = parent.RelativePath.Length + 1L + child.Name.Length;
+                if (!ReserveMemory(512L + (4L * pathLength)))
+                {
+                    return exclusions;
+                }
+
                 child.InSubtree = true;
                 child.Depth = childDepth;
                 child.RelativePath = ScanPath.Join(parent.RelativePath, child.Name);
@@ -265,6 +285,17 @@ internal sealed class NtfsDirectoryMap
         }
 
         return exclusions;
+    }
+
+    private bool ReserveMemory(long bytes)
+    {
+        if (_collector is null || _collector.TryReserveMemory(bytes))
+        {
+            return true;
+        }
+
+        MemoryLimitReached = true;
+        return false;
     }
 
     /// <summary>

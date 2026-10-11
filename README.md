@@ -112,8 +112,13 @@ runner's limits.
 
 The default limits are two directory workers, 500,000 entries and diagnostics
 combined, directory depth 256, and 200 retained diagnostics. Hitting a limit marks
-the result incomplete. Entry limits bound counts, not heap bytes; run large scans
-under the hard process limits above. Hidden and system entries are included unless
+the result incomplete. A separate memory budget estimates retained paths, inferred
+folders, diagnostics, backend workspace, and snapshot construction. It defaults to
+half the managed heap still available at scan start. `ScanOptions.MemoryBudgetBytes`
+can request a smaller allowance. Discovery stops before accepting an entry that
+exceeds it and publishes the discovered data as an explicitly incomplete map,
+including free and unaccounted space for volume scans. This estimate supplements
+the hard process limits above. Hidden and system entries are included unless
 `SkipAttributes` requests otherwise. Links retain zero-byte placeholders and are
 never followed; a link selected as the root is rejected.
 

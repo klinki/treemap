@@ -7,8 +7,8 @@ namespace Treemap.Scanning;
 /// </summary>
 /// <remarks>
 /// Instances are immutable. <see cref="FileSystemScanner.ScanAsync"/> validates the values
-/// before any I/O and throws <see cref="ArgumentOutOfRangeException"/> rather than
-/// silently clamping them.
+/// before any I/O and throws <see cref="ArgumentOutOfRangeException"/> for invalid
+/// values. The available heap also limits <see cref="MemoryBudgetBytes"/>.
 /// </remarks>
 public sealed record ScanOptions
 {
@@ -55,6 +55,15 @@ public sealed record ScanOptions
     /// reported through <see cref="ScanResult.IsComplete"/>.
     /// </summary>
     public long MaxEntries { get; init; } = DefaultMaxEntries;
+
+    /// <summary>
+    /// Optional allowance for estimated scan storage and snapshot construction, in bytes.
+    /// Must be positive. Null uses half the managed heap still available when the scan
+    /// starts; the automatic maximum still applies to an explicit value. Long paths and inferred
+    /// folders cost more than flat entries. Reaching it returns an incomplete map.
+    /// This estimate supplements external process limits; it is not a hard heap cap.
+    /// </summary>
+    public long? MemoryBudgetBytes { get; init; }
 
     /// <summary>
     /// How many diagnostics to retain. Further problems keep counting against
@@ -146,6 +155,11 @@ public sealed record ScanOptions
         if (MaxEntries < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxEntries), MaxEntries, "Must be at least 1.");
+        }
+
+        if (MemoryBudgetBytes is < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(MemoryBudgetBytes), MemoryBudgetBytes, "Must be positive when specified.");
         }
 
         if (MaxDiagnostics < 0)

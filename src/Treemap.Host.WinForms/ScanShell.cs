@@ -107,6 +107,13 @@ internal sealed class ScanShell : Form
     private int _generation;
     private bool _disposed;
 
+    /// <summary>
+    /// The fallback reason already folded into the status line of the running scan, so
+    /// a reason carried on every later tick is shown once instead of appended per tick.
+    /// Reset for each scan; only the UI thread touches it.
+    /// </summary>
+    private string? _liveFallbackReason;
+
     // Filter summary cache: animation Layout ticks must not rebuild the same
     // count/totals strings repeatedly. Totals can only change with a new display
     // projection or a new expression.
@@ -709,6 +716,7 @@ internal sealed class ScanShell : Form
         _backendLabel.Text = "Backend: choosing...";
         _progressLabel.Text = string.Empty;
         _statusLabel.Text = $"Scanning {rootPath}";
+        _liveFallbackReason = null;
         ResetProgressForNewScan();
 
         try
@@ -763,10 +771,18 @@ internal sealed class ScanShell : Form
                 ResetProgressToZero();
             }
         }
-        catch (Exception exception) when (exception is not OutOfMemoryException)
+        catch (OutOfMemoryException)
         {
-            // OutOfMemoryException is deliberately not caught: a process that cannot
-            // allocate is not a scan that failed, and saying otherwise hides the reason.
+            if (IsCurrent(generation))
+            {
+                _backendLabel.Text = "Backend: none";
+                _progressLabel.Text = string.Empty;
+                _statusLabel.Text = "Scan failed: out of memory. Try a smaller folder.";
+                ResetProgressToZero();
+            }
+        }
+        catch (Exception exception)
+        {
             if (IsCurrent(generation))
             {
                 _backendLabel.Text = "Backend: none";
@@ -947,6 +963,24 @@ internal sealed class ScanShell : Form
         if (!IsCurrent(generation))
         {
             return;
+        }
+
+        // The scanner announces its backend on its ticks, so the label moves off
+        // "choosing" as soon as the attempt begins, and a mid-scan fallback shows
+        // here at the transition rather than only in the finished status line.
+        if (tick.ActiveBackend.HasValue)
+        {
+            string active = DescribeBackend(tick.ActiveBackend.Value);
+            _backendLabel.Text = tick.FallbackFrom.HasValue
+                ? $"Backend: {active} (fell back from {DescribeBackend(tick.FallbackFrom.Value)})"
+                : $"Backend: {active}";
+        }
+
+        if (!string.IsNullOrEmpty(tick.FallbackReason)
+            && !string.Equals(_liveFallbackReason, tick.FallbackReason, StringComparison.Ordinal))
+        {
+            _liveFallbackReason = tick.FallbackReason;
+            _statusLabel.Text += $" Fell back: {tick.FallbackReason}";
         }
 
         // Determinate only while the scan reports a discovery estimate;

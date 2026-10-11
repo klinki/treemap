@@ -31,6 +31,8 @@ internal sealed class ScanCollector
     private readonly IProgress<ScanProgress>? _progress;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly Lock _gate = new();
+    private readonly long _memoryLimit;
+    private readonly int _rootPathLength;
 
     private readonly List<ScanEntry> _entries = [];
     private readonly List<ScanDiagnostic> _diagnostics = [];
@@ -43,15 +45,22 @@ internal sealed class ScanCollector
     private long _hardLinkedFiles;
     private long _suppressedDiagnostics;
     private long _budgetUsed;
+    private long _estimatedMemoryBytes;
+    private bool _memoryLimitReached;
     private long _nextReportAt;
+    private ScanBackend? _activeBackend;
+    private ScanBackend? _fallbackFrom;
+    private string? _fallbackReason;
     private string? _incompleteReason;
     private bool _allocationUnavailable;
     private bool _complete = true;
 
-    public ScanCollector(ScanOptions options, IProgress<ScanProgress>? progress)
+    public ScanCollector(ScanOptions options, IProgress<ScanProgress>? progress, int rootPathLength = 0)
     {
         _options = options;
         _progress = progress;
+        _memoryLimit = ScanMemoryBudget.ResolveLimit(options);
+        _rootPathLength = rootPathLength;
     }
 
     public IReadOnlyList<ScanEntry> Entries
@@ -167,6 +176,17 @@ internal sealed class ScanCollector
     /// </summary>
     public long? UsedBytesForProgress { get; set; }
 
+    /// <summary>Sets the backend triple under one gate so a tick never sees a partial update.</summary>
+    public void SetBackend(ScanBackend? activeBackend, ScanBackend? fallbackFrom, string? fallbackReason)
+    {
+        lock (_gate)
+        {
+            _activeBackend = activeBackend;
+            _fallbackFrom = fallbackFrom;
+            _fallbackReason = fallbackReason;
+        }
+    }
+
     /// <summary>False as soon as anything failed, was truncated or was approximated.</summary>
     public bool IsComplete
     {
@@ -199,6 +219,12 @@ internal sealed class ScanCollector
     {
         lock (_gate)
         {
+            if (_memoryLimitReached || _estimatedMemoryBytes >= _memoryLimit)
+            {
+                MarkMemoryLimitLocked();
+                return true;
+            }
+
             if (_budgetUsed < _options.MaxEntries)
             {
                 return false;
@@ -231,7 +257,14 @@ internal sealed class ScanCollector
     {
         lock (_gate)
         {
-            if (!ClaimLocked())
+            long cost = ScanMemoryBudget.EstimateEntry(relativePath);
+            if (kind == NodeKind.Folder)
+            {
+                // Portable discovery retains absolute paths for queued folders.
+                cost += 2L * _rootPathLength;
+            }
+
+            if (!ClaimLocked(cost))
             {
                 return false;
             }
@@ -283,7 +316,10 @@ internal sealed class ScanCollector
             MarkIncompleteLocked(message);
         }
 
-        if (!ClaimLocked() || _diagnostics.Count >= _options.MaxDiagnostics)
+        long cost = _diagnostics.Count < _options.MaxDiagnostics
+            ? ScanMemoryBudget.EstimateDiagnostic(path, message)
+            : 0;
+        if (!ClaimLocked(cost) || _diagnostics.Count >= _options.MaxDiagnostics)
         {
             _suppressedDiagnostics++;
             return;
@@ -336,6 +372,9 @@ internal sealed class ScanCollector
         long entries;
         long logical;
         long represented;
+        ScanBackend? activeBackend;
+        ScanBackend? fallbackFrom;
+        string? fallbackReason;
 
         lock (_gate)
         {
@@ -349,6 +388,9 @@ internal sealed class ScanCollector
             entries = _entries.Count;
             logical = _logicalBytes;
             represented = _representedBytes;
+            activeBackend = _activeBackend;
+            fallbackFrom = _fallbackFrom;
+            fallbackReason = _fallbackReason;
         }
 
         // Computed outside the gate from the captured count and the cached used
@@ -387,7 +429,13 @@ internal sealed class ScanCollector
             }
         }
 
-        ScanProgress tick = new(phase, currentPath, entries, logical) { PercentComplete = percent };
+        ScanProgress tick = new(phase, currentPath, entries, logical)
+        {
+            PercentComplete = percent,
+            ActiveBackend = activeBackend,
+            FallbackFrom = fallbackFrom,
+            FallbackReason = fallbackReason,
+        };
 
         progress.Report(tick);
     }
@@ -426,7 +474,9 @@ internal sealed class ScanCollector
         lock (_gate)
         {
             _entries.Clear();
+            _entries.TrimExcess();
             _diagnostics.Clear();
+            _diagnostics.TrimExcess();
             _files = 0;
             _directories = 0;
             _logicalBytes = 0;
@@ -435,6 +485,8 @@ internal sealed class ScanCollector
             _hardLinkedFiles = 0;
             _suppressedDiagnostics = 0;
             _budgetUsed = 0;
+            _estimatedMemoryBytes = 0;
+            _memoryLimitReached = false;
             _incompleteReason = null;
             _allocationUnavailable = false;
             _complete = true;
@@ -442,16 +494,56 @@ internal sealed class ScanCollector
     }
 
     /// <summary>Claims one unit of the shared budget. Caller holds the gate.</summary>
-    private bool ClaimLocked()
+    private bool ClaimLocked(long memoryCost)
     {
+        if (_memoryLimitReached)
+        {
+            return false;
+        }
+
         if (_budgetUsed >= _options.MaxEntries)
         {
             MarkIncompleteLocked($"Stopped after {_options.MaxEntries} entries, the configured budget.");
             return false;
         }
 
+        if (!ReserveMemoryLocked(memoryCost))
+        {
+            return false;
+        }
+
         _budgetUsed++;
         return true;
+    }
+
+    /// <summary>Charges backend workspace, including the NTFS directory map.</summary>
+    public bool TryReserveMemory(long bytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        lock (_gate)
+        {
+            return ReserveMemoryLocked(bytes);
+        }
+    }
+
+    private bool ReserveMemoryLocked(long bytes)
+    {
+        if (_memoryLimitReached || bytes > _memoryLimit - _estimatedMemoryBytes)
+        {
+            MarkMemoryLimitLocked();
+            return false;
+        }
+
+        _estimatedMemoryBytes += bytes;
+        return true;
+    }
+
+    private void MarkMemoryLimitLocked()
+    {
+        _memoryLimitReached = true;
+        _complete = false;
+        // Resource truncation must remain visible even after an access diagnostic.
+        _incompleteReason = $"Stopped after {_entries.Count:N0} entries to stay within the scan memory budget. Scan a smaller folder for more detail";
     }
 
     private void MarkIncompleteLocked(string reason)

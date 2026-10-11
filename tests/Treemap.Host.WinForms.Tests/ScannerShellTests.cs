@@ -162,6 +162,33 @@ public class ScannerShellTests
     });
 
     [Fact]
+    public void AnOutOfMemoryScanReportsMemoryFailureAndFreesTheControls() => StaRunner.Run(() =>
+    {
+        using ScanShell shell = CreateShell(scanRunner: FailingScan(new OutOfMemoryException()));
+
+        shell.Publisher.Publish(Trees.WithMarker(42));
+        StaRunner.PumpUntil(() => HasCell(shell, 42));
+
+        shell.StartScan(@"C:\big");
+        StaRunner.PumpUntil(() => !shell.IsScanning);
+
+        // Observed as a visible failure, never as success and never stale.
+        Assert.StartsWith("Scan failed:", shell.StatusText, StringComparison.Ordinal);
+        Assert.Contains("out of memory", shell.StatusText, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Scanning", shell.StatusText, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("choosing", shell.BackendText, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(string.Empty, shell.ProgressText);
+        Assert.Equal(0, shell.ProgressBarControl.Value);
+        Assert.False(shell.IsScanning);
+        Assert.True(shell.CanScan);
+        Assert.False(shell.CanCancel);
+
+        // Nothing valid was kept: the prior map is still the one on screen.
+        Assert.Equal(1L, shell.Publisher.Current.Version);
+        Assert.True(HasCell(shell, 42));
+    });
+
+    [Fact]
     public void AProgressTickFromASupersededScanIsIgnored() => StaRunner.Run(() =>
     {
         int runs = 0;

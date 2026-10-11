@@ -66,6 +66,22 @@ public readonly record struct ScanProgress(
     /// or unavailable capacity. A zero used-byte total reports 0, never null.
     /// </summary>
     public int? PercentComplete { get; init; }
+
+    /// <summary>
+    /// The backend currently doing the work, once one has been selected. Null only
+    /// before selection: the scan starts choosing, then reports NTFS or portable as
+    /// soon as the attempt begins, so a host never sits on "choosing" for a whole walk.
+    /// </summary>
+    public ScanBackend? ActiveBackend { get; init; }
+
+    /// <summary>
+    /// The backend that was tried and abandoned for the portable retry, once a
+    /// fallback has happened. Null when no backend has been abandoned.
+    /// </summary>
+    public ScanBackend? FallbackFrom { get; init; }
+
+    /// <summary>Why <see cref="FallbackFrom"/> was abandoned, once it has been.</summary>
+    public string? FallbackReason { get; init; }
 }
 
 /// <summary>One bounded, human-readable note about something the scan could not do exactly.</summary>
