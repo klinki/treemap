@@ -52,6 +52,16 @@ internal sealed class ScanShell : Form
     private readonly Label _backendLabel = new() { AutoSize = true };
     private readonly Label _progressLabel = new() { AutoSize = true };
     private readonly Label _statusLabel = new() { AutoSize = true };
+    private readonly ProgressBar _progressBar = new()
+    {
+        Dock = DockStyle.Top,
+        Minimum = 0,
+        Maximum = 100,
+        Value = 0,
+        Style = ProgressBarStyle.Continuous,
+        MarqueeAnimationSpeed = 30,
+        Height = 12,
+    };
 
     private readonly Button _backButton = new() { Text = "Back", AutoSize = true, Enabled = false };
     private readonly Button _forwardButton = new() { Text = "Forward", AutoSize = true, Enabled = false };
@@ -61,6 +71,19 @@ internal sealed class ScanShell : Form
     private readonly Button _lessButton = new() { Text = "Less detail", AutoSize = true, Enabled = false };
     private readonly CheckBox _freeBox = new() { Text = "Free space", Appearance = Appearance.Button, AutoSize = true };
     private readonly CheckBox _unaccountedBox = new() { Text = "Unaccounted space", Appearance = Appearance.Button, AutoSize = true };
+    private readonly FlowLayoutPanel _filterRow = new()
+    {
+        Dock = DockStyle.Top,
+        AutoSize = true,
+        WrapContents = true,
+        FlowDirection = FlowDirection.LeftToRight,
+        Padding = new Padding(6, 0, 6, 4),
+    };
+    private readonly Label _filterLabel = new() { Text = "Filter:", AutoSize = true };
+    private readonly TextBox _filterBox = new() { Width = 200, PlaceholderText = "e.g. *.mp4", MaxLength = 256 };
+    private readonly Button _applyFilterButton = new() { Text = "Apply", AutoSize = true };
+    private readonly Button _clearFilterButton = new() { Text = "Clear", AutoSize = true };
+    private readonly Label _filterInfoLabel = new() { AutoSize = true };
 
     private bool _refreshingNav;
 
@@ -83,6 +106,13 @@ internal sealed class ScanShell : Form
     private CancellationTokenSource? _scanCts;
     private int _generation;
     private bool _disposed;
+
+    // Filter summary cache: animation Layout ticks must not rebuild the same
+    // count/totals strings repeatedly. Totals can only change with a new display
+    // projection or a new expression.
+    private TreemapSnapshot? _filterInfoSnapshot;
+    private string _filterInfoPattern = "\0";
+    private long _filterInfoCount = -1;
 
     internal ScanShell(
         ScanRunner? scanRunner = null,
@@ -143,6 +173,9 @@ internal sealed class ScanShell : Form
         _lessButton.Click += (_, _) => ChangeDetail(increase: false);
         _freeBox.CheckedChanged += (_, _) => ApplySpaceVisibility();
         _unaccountedBox.CheckedChanged += (_, _) => ApplySpaceVisibility();
+        _applyFilterButton.Click += (_, _) => ApplyFilter();
+        _clearFilterButton.Click += (_, _) => ClearFilter();
+        _filterBox.KeyDown += OnFilterKeyDown;
 
         _view.Controller.Changed += OnViewChanged;
         RefreshNav();
@@ -181,6 +214,20 @@ internal sealed class ScanShell : Form
     internal CheckBox FreeSpaceBox => _freeBox;
 
     internal CheckBox UnaccountedSpaceBox => _unaccountedBox;
+
+    internal ProgressBar ProgressBarControl => _progressBar;
+
+    internal Control FilterRow => _filterRow;
+
+    internal TextBox FilterBox => _filterBox;
+
+    internal Button ApplyFilterButton => _applyFilterButton;
+
+    internal Button ClearFilterButton => _clearFilterButton;
+
+    internal Label FilterInfoLabel => _filterInfoLabel;
+
+    internal string FilterInfoText => _filterInfoLabel.Text;
 
     // ---- layout ----
 
@@ -229,6 +276,16 @@ internal sealed class ScanShell : Form
         navBar.Controls.Add(_freeBox);
         navBar.Controls.Add(_unaccountedBox);
 
+        // Filename filter: typing alone changes nothing until Apply or Enter.
+        // Applying recalculates folder sizes from matching files only - no disk
+        // IO, no rescan - and the filtered view simply omits the volume-space
+        // blocks regardless of the toggle boxes above. Clearing restores them.
+        _filterRow.Controls.Add(_filterLabel);
+        _filterRow.Controls.Add(_filterBox);
+        _filterRow.Controls.Add(_applyFilterButton);
+        _filterRow.Controls.Add(_clearFilterButton);
+        _filterRow.Controls.Add(_filterInfoLabel);
+
         FlowLayoutPanel status = new()
         {
             Dock = DockStyle.Bottom,
@@ -243,9 +300,12 @@ internal sealed class ScanShell : Form
         status.Controls.Add(_statusLabel);
 
         // Added fill first: WinForms docks from the last child back, so the view is laid
-        // out last and takes whatever the two panels leave behind. The navigation bar
-        // is added before the scan toolbar so it docks directly beneath it.
+        // out last and takes whatever the panels leave behind. The navigation bar
+        // docks directly beneath the scan toolbar, the full-width progress bar
+        // below those rows, and the filter row below the bar.
         Controls.Add(_view);
+        Controls.Add(_filterRow);
+        Controls.Add(_progressBar);
         Controls.Add(navBar);
         Controls.Add(toolbar);
         Controls.Add(status);
@@ -282,6 +342,112 @@ internal sealed class ScanShell : Form
         _backendLabel.MaximumSize = new Size(width, 0);
         _progressLabel.MaximumSize = new Size(width, 0);
         _statusLabel.MaximumSize = new Size(width, 0);
+        _filterInfoLabel.MaximumSize = new Size(width, 0);
+    }
+
+    // ---- filename filter ----
+
+    private void OnFilterKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyCode != Keys.Enter)
+        {
+            return;
+        }
+
+        // Handled and suppressed: applying the filter must not ding.
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+        ApplyFilter();
+    }
+
+    /// <summary>
+    /// Applies the filter box text to the current snapshot. Layout only: folder
+    /// sizes are recalculated from matching files, the published tree is
+    /// untouched, and nothing rescans. Blank or <c>*</c> clears the filter.
+    /// </summary>
+    internal void ApplyFilter()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (_view.Controller.ApplyFileFilter(_filterBox.Text))
+        {
+            _view.Controller.Relayout(animate: true);
+        }
+
+        UpdateFilterInfo();
+        RefreshNav();
+    }
+
+    internal void ClearFilter()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _filterBox.Text = string.Empty;
+        ApplyFilter();
+    }
+
+    /// <summary>
+    /// Mirrors the filtered view onto the filter row: matching file count plus
+    /// logical/allocated totals, or an explicit no-matches message. Empty while
+    /// no filter is active; the scan status line stays separate. Cached by
+    /// display projection reference and expression, so animation Layout ticks
+    /// do not rebuild the same strings.
+    /// </summary>
+    internal void UpdateFilterInfo()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        string pattern = _view.Controller.FilterPattern;
+        if (pattern.Length == 0)
+        {
+            if (_filterInfoPattern.Length == 0
+                && _filterInfoLabel.Text.Length == 0
+                && _filterInfoSnapshot is null)
+            {
+                return;
+            }
+
+            _filterInfoSnapshot = null;
+            _filterInfoPattern = string.Empty;
+            _filterInfoCount = -1;
+            _filterInfoLabel.Text = string.Empty;
+            return;
+        }
+
+        TreemapSnapshot display = _view.Controller.DisplaySnapshot;
+        long count = _view.Controller.DisplayFileCount;
+
+        if (ReferenceEquals(display, _filterInfoSnapshot)
+            && string.Equals(pattern, _filterInfoPattern, StringComparison.Ordinal)
+            && count == _filterInfoCount)
+        {
+            return;
+        }
+
+        _filterInfoSnapshot = display;
+        _filterInfoPattern = pattern;
+        _filterInfoCount = count;
+
+        if (count == 0)
+        {
+            _filterInfoLabel.Text = $"No files match '{pattern}'. Free/unaccounted blocks are hidden while filtering.";
+            return;
+        }
+
+        _filterInfoLabel.Text =
+            $"{count:N0} files match '{pattern}' - " +
+            $"{SizeFormat.FormatBytes(display.Root.LogicalSize)} logical, " +
+            $"{SizeFormat.FormatBytes(display.Root.PhysicalSize)} allocated. " +
+            $"Free/unaccounted blocks are hidden while filtering.";
     }
 
     // ---- startup ----
@@ -454,6 +620,13 @@ internal sealed class ScanShell : Form
             return;
         }
 
+        // A new preview re-applies the filter in the controller, so the matching
+        // totals change with it. Hover and selection never do.
+        if ((kind & (ChangeKind.Layout | ChangeKind.Navigation)) != 0)
+        {
+            UpdateFilterInfo();
+        }
+
         RefreshNav();
     }
 
@@ -536,6 +709,7 @@ internal sealed class ScanShell : Form
         _backendLabel.Text = "Backend: choosing...";
         _progressLabel.Text = string.Empty;
         _statusLabel.Text = $"Scanning {rootPath}";
+        ResetProgressForNewScan();
 
         try
         {
@@ -586,6 +760,7 @@ internal sealed class ScanShell : Form
                 _backendLabel.Text = "Backend: cancelled";
                 _progressLabel.Text = string.Empty;
                 _statusLabel.Text = "Scan cancelled. The treemap still shows the previous scan.";
+                ResetProgressToZero();
             }
         }
         catch (Exception exception) when (exception is not OutOfMemoryException)
@@ -597,12 +772,15 @@ internal sealed class ScanShell : Form
                 _backendLabel.Text = "Backend: none";
                 _progressLabel.Text = string.Empty;
                 _statusLabel.Text = $"Scan failed: {exception.Message}";
+                ResetProgressToZero();
             }
         }
         finally
         {
             // Released only now, where the work has stopped: disposing a source whose
-            // token a worker may still read turns a cancel into a crash.
+            // token a worker may still read turns a cancel into a crash. The bar is
+            // deliberately untouched here: the outcome paths above already set it,
+            // and a stale completion must not overwrite a newer scan's marquee.
             cts.Dispose();
 
             if (ReferenceEquals(_scanCts, cts))
@@ -771,8 +949,54 @@ internal sealed class ScanShell : Form
             return;
         }
 
+        // Determinate only while the scan reports a discovery estimate;
+        // otherwise the bar runs marquee for the whole active scan.
+        // ScanProgress.PercentComplete is a nullable 0..99 estimate until
+        // Finished reports 100; a non-finished tick claiming 100 is clamped
+        // back to 99 so the bar never shows full before the accepted finish.
+        if (tick.PercentComplete.HasValue)
+        {
+            int percent = Math.Clamp(tick.PercentComplete.Value, 0, 100);
+            if (tick.Phase != ScanPhase.Finished && percent >= 100)
+            {
+                percent = 99;
+            }
+
+            _progressBar.Style = ProgressBarStyle.Continuous;
+            _progressBar.Value = percent;
+        }
+        else
+        {
+            _progressBar.Style = ProgressBarStyle.Marquee;
+        }
+
         _progressLabel.Text =
             $"{DescribePhase(tick.Phase)} - {tick.EntriesScanned:N0} entries, {FormatSize(tick.BytesScanned)}";
+    }
+
+    /// <summary>
+    /// Marquee from zero: nothing is known until the first estimate, and the
+    /// prior run's 100 must not sit in the model beneath the new animation.
+    /// </summary>
+    private void ResetProgressForNewScan()
+    {
+        _progressBar.Style = ProgressBarStyle.Continuous;
+        _progressBar.Value = 0;
+        _progressBar.Style = ProgressBarStyle.Marquee;
+    }
+
+    /// <summary>Stops the bar at zero. Only non-success outcomes come here.</summary>
+    private void ResetProgressToZero()
+    {
+        _progressBar.Style = ProgressBarStyle.Continuous;
+        _progressBar.Value = 0;
+    }
+
+    /// <summary>Stops the bar at full. Only an accepted finish comes here.</summary>
+    private void SetProgressComplete()
+    {
+        _progressBar.Style = ProgressBarStyle.Continuous;
+        _progressBar.Value = 100;
     }
 
     /// <summary>
@@ -795,6 +1019,15 @@ internal sealed class ScanShell : Form
         }
 
         _progressLabel.Text = string.Empty;
+
+        // An accepted finish owns the bar at full, consistently with
+        // ScanProgress.Finished: complete or incomplete, the scan ran to its
+        // end, so the bar stops at 100. The incomplete warning and the residual
+        // unaccounted block stay in the status line and the map. Only
+        // cancellation and failure reset to zero, in their own handlers.
+        SetProgressComplete();
+
+        UpdateFilterInfo();
 
         string status =
             $"Finished in {result.Duration.TotalSeconds:F1}s - {result.FileCount:N0} files, " +

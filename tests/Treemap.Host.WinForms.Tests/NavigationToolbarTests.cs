@@ -65,6 +65,17 @@ public class NavigationToolbarTests
     });
 
     [Fact]
+    public void OptionalBlocksAreCheckedByDefault() => StaRunner.Run(() =>
+    {
+        using ScanShell shell = CreateShell(Tree());
+
+        Assert.True(shell.View.Controller.ShowFreeSpace);
+        Assert.True(shell.View.Controller.ShowUnknownSpace);
+        Assert.True(shell.FreeSpaceBox.Checked);
+        Assert.True(shell.UnaccountedSpaceBox.Checked);
+    });
+
+    [Fact]
     public void DetailButtonsMoveDepthWithoutTouchingZoom() => StaRunner.Run(() =>
     {
         using ScanShell shell = CreateShell(Tree());
@@ -98,25 +109,25 @@ public class NavigationToolbarTests
         TreemapNode root = shell.Publisher.Current.Root;
         PumpSettled(shell);
 
-        // Optional blocks start hidden, as in the reference recording.
-        // Departing cells linger one settled union frame at alpha 0 (existing
-        // animator contract), so removal means no VISIBLE cell, matching the
-        // renderer/hit-test threshold.
-        Assert.False(shell.FreeSpaceBox.Checked);
-        Assert.False(shell.UnaccountedSpaceBox.Checked);
+        // Optional blocks start shown. Departing cells linger one settled union
+        // frame at alpha 0 (existing animator contract), so removal means no
+        // VISIBLE cell, matching the renderer/hit-test threshold.
+        Assert.True(shell.FreeSpaceBox.Checked);
+        Assert.True(shell.UnaccountedSpaceBox.Checked);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 7 && c.Alpha > 0.01f);
+
+        shell.FreeSpaceBox.Checked = false;
+        PumpSettled(shell);
         Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
 
         shell.FreeSpaceBox.Checked = true;
         PumpSettled(shell);
         Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
 
-        shell.FreeSpaceBox.Checked = false;
+        shell.UnaccountedSpaceBox.Checked = false;
         PumpSettled(shell);
-        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
-
-        shell.UnaccountedSpaceBox.Checked = true;
-        PumpSettled(shell);
-        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 7 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 7 && c.Alpha > 0.01f);
 
         // Layout only: same snapshot, same tree, nothing rescanned.
         Assert.Equal(version, shell.Publisher.Current.Version);

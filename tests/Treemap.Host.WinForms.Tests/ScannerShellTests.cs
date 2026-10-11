@@ -297,7 +297,11 @@ public class ScannerShellTests
 
         Control[] controls = Descendants(shell).ToArray();
         string[] buttons = controls.OfType<Button>().Select(button => button.Text).ToArray();
-        Label[] statusLines = controls.OfType<Label>().ToArray();
+
+        // Only the three scan status lines: the filter row carries its own labels.
+        Label[] statusLines = controls.OfType<Label>()
+            .Where(label => label.Parent is not null && label.Parent.Dock == DockStyle.Bottom)
+            .ToArray();
 
         // Guards the loops below from passing on an empty enumeration.
         Assert.Contains("Scan", buttons);

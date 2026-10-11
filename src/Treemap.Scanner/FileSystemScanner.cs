@@ -189,22 +189,14 @@ public sealed class FileSystemScanner
         ScanBackend backend = ScanBackend.Portable;
         bool needPortableScan = true;
 
-        collector.Report(ScanPhase.Starting, fullRootPath, force: true);
-        cancellationToken.ThrowIfCancellationRequested();
-
-        // One identity transaction for the whole scan, opened before any backend runs:
-        // previews reserve from the same pending map the final tree builds from, so an
-        // id seen in a preview is the id the final tree and the next rescan use. Only
-        // a finished scan commits; anything else aborts and keeps the last good map.
-        _ids.BeginBuild();
+        bool isVolumeRoot = ScanTreeBuilder.IsVolumeRoot(fullRootPath);
 
         bool wantPreviews = options.PublishIntermediateSnapshots && publisher is not null;
-        PreviewLoop? previews = null;
-        TreemapSnapshot? snapshot = null;
 
         // Volume accounting is read once and cached: every preview and the final tree
-        // measure free and unaccounted space against the same basis. The timer thread
-        // and the scan thread can both reach it, so the read is under its own gate.
+        // measure free and unaccounted space against the same basis. Folder scans never
+        // query capacity. A volume scan reads it only when progress, previews, or final
+        // accounting need it; progress then reuses the same cached basis.
         object volumeGate = new();
         VolumeSpaceInfo? volumeSpace = null;
         bool volumeSpaceRead = false;
@@ -222,12 +214,44 @@ public sealed class FileSystemScanner
             }
         }
 
+        if (isVolumeRoot && progress is not null)
+        {
+            // Folders never reach here. Unavailable capacity leaves the total null
+            // (marquee); a clamped zero total reports 0. Shares the cached read the
+            // previews and the final tree use.
+            VolumeSpaceInfo? space = GetVolumeSpace();
+            if (space is not null)
+            {
+                long total = space.TotalSize > 0 ? space.TotalSize : 0;
+                long free = Math.Clamp(space.FreeSpaceBytes, 0, total);
+                collector.UsedBytesForProgress = total <= free ? 0 : total - free;
+            }
+        }
+
+        collector.Report(ScanPhase.Starting, fullRootPath, force: true);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // One identity transaction for the whole scan, opened before any backend runs:
+        // previews reserve from the same pending map the final tree builds from, so an
+        // id seen in a preview is the id the final tree and the next rescan use. Only
+        // a finished scan commits; anything else aborts and keeps the last good map.
+        _ids.BeginBuild();
+
+        PreviewLoop? previews = null;
+        TreemapSnapshot? snapshot = null;
+
         try
         {
             if (wantPreviews)
             {
                 previews = new PreviewLoop(
                     collector, publisher!, _ids, fullRootPath, options, GetVolumeSpace, publisher!.Current, cancellationToken);
+
+                // Synchronous initial basis on the scanning thread, before any backend
+                // runs: an empty root with the cached free/unaccounted blocks. Later
+                // previews replace the residual with discovered entries. Shares the
+                // same pending identities and prior snapshot; the timer starts after.
+                previews.PublishInitialBasis();
                 previews.Start();
             }
 
@@ -587,6 +611,97 @@ public sealed class FileSystemScanner
         }
 
         /// <summary>
+        /// Publishes the initial volume basis synchronously on the scanning thread,
+        /// before any backend runs: an empty root with the cached free/unaccounted
+        /// blocks. Shares the scan's pending identity transaction and prior snapshot,
+        /// so the free/unknown ids here are the ids the final tree uses. Only enabled
+        /// space blocks participate; folder scans, final-only callers and unavailable
+        /// capacity publish nothing. The timer still starts after this returns.
+        /// A throwing subscriber propagates after the snapshot is visible, and the
+        /// scan's catch restores the prior map and aborts identity.
+        /// </summary>
+        public void PublishInitialBasis()
+        {
+            lock (_gate)
+            {
+                PublishInitialBasisLocked();
+            }
+        }
+
+        private void PublishInitialBasisLocked()
+        {
+            if (_stopped || _poisoned)
+            {
+                return;
+            }
+
+            _cancellationToken.ThrowIfCancellationRequested();
+
+            TreemapNode? initial = BuildInitialRoot();
+            if (initial is null)
+            {
+                return;
+            }
+
+            _cancellationToken.ThrowIfCancellationRequested();
+
+            long before = _publisher.Current.Version;
+            try
+            {
+                _publisher.Publish(initial, _fullRootPath);
+            }
+            finally
+            {
+                // Visible before subscribers run, so a throwing subscriber still
+                // left this map on screen: count it so the catch restores.
+                // _builtEntries stays 0 - no entries yet, so the first real
+                // preview still fires and empty trees never republish.
+                if (_publisher.Current.Version != before)
+                {
+                    Interlocked.Increment(ref _published);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Empty root plus space blocks against represented zero, or null when there
+        /// is no volume basis to show. Uses the shared cached capacity, never disk IO.
+        /// </summary>
+        private TreemapNode? BuildInitialRoot()
+        {
+            if (!_isVolumeRoot)
+            {
+                return null;
+            }
+
+            if (!_options.IncludeFreeSpace && !_options.IncludeUnknownSpace)
+            {
+                return null;
+            }
+
+            VolumeSpaceInfo? space = _volumeSpace();
+            if (space is null)
+            {
+                return null;
+            }
+
+            _cancellationToken.ThrowIfCancellationRequested();
+
+            TreemapNode empty = ScanTreeBuilder.Build(
+                _fullRootPath, Array.Empty<ScanEntry>(), _ids, _cancellationToken);
+            TreemapNode withSpace = AddVolumeSpace(
+                empty, _fullRootPath, space, 0, _options, _ids,
+                out long freeSpace, out long unknownSpace);
+
+            if (freeSpace <= 0 && unknownSpace <= 0)
+            {
+                return null;
+            }
+
+            return withSpace;
+        }
+
+        /// <summary>
         /// Stops the timer and waits out an in-flight build. Idempotent, and never
         /// throws: by the time it returns, no preview from this scan can still publish.
         /// </summary>
@@ -647,7 +762,9 @@ public sealed class FileSystemScanner
         /// reserved, and puts the map from before the scan back on screen. The reset,
         /// the identity restart and the count reset run under the gate as one step,
         /// so an in-flight preview can neither capture abandoned entries after they
-        /// are dropped nor publish over the restored map.
+        /// are dropped nor publish over the restored map. For a volume scan the
+        /// initial empty-plus-space basis is then republished for the portable retry,
+        /// serially under the same gate.
         /// </summary>
         public void AbandonAndRestore(ScanCollector collector)
         {
@@ -680,6 +797,11 @@ public sealed class FileSystemScanner
                 // preview gets a fresh id if a later scan shows it again, while
                 // paths in the last accepted tree keep their committed ids.
                 _ids.BeginBuild();
+
+                // Same basis the scan opened with. On the scanning thread, so a
+                // throwing subscriber propagates to the scan's catch, which restores
+                // and aborts; timer faults are still captured on the pool thread.
+                PublishInitialBasisLocked();
             }
         }
 

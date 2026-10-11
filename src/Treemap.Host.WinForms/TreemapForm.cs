@@ -54,6 +54,8 @@ public sealed class TreemapForm : Control
     private readonly RenderState _renderState;
     private readonly SnapshotPublisher _publisher;
     private readonly System.Windows.Forms.Timer _timer;
+    private readonly System.Windows.Forms.Timer _resizeTimer;
+    private readonly System.Windows.Forms.Timer _clickTimer;
     private readonly ToolTip _toolTip = new()
     {
         AutoPopDelay = 10_000,
@@ -63,6 +65,8 @@ public sealed class TreemapForm : Control
 
     private int _tooltipNodeId = -2;
     private long _tooltipVersion = -1;
+    private TreemapSnapshot? _tooltipSnapshot;
+    private string? _tooltipFilter;
 
     private Bitmap? _backBuffer;
     private SKBitmap? _bitmap;
@@ -70,6 +74,17 @@ public sealed class TreemapForm : Control
 
     private int _publishPending;
     private int _updateScheduled;
+
+    // Deferred single-click expansion: MouseDown latches the hit id, MouseUp on a
+    // clean release starts the double-click interval, and the timer fires the
+    // expansion by id. A double-click navigates to the latched folder instead.
+    // A blank press latches id -1 with the flag set, so releasing it clears the
+    // prior selection and expansion.
+    private bool _hasPendingClick;
+    private int _pendingClickId = -1;
+    private string? _pendingSource;
+    private string? _pendingFilter;
+    private int _pendingFocusRoot;
 
     // Read from the publishing thread as well as the UI thread.
     private volatile bool _disposed;
@@ -91,11 +106,11 @@ public sealed class TreemapForm : Control
             InnerPadding = 1.5f,
 
             // Reference style: readable top-level layers with folder headers, and
-            // the synthetic space blocks hidden until the user asks for them.
+            // the synthetic space blocks shown until the user hides them.
             MaxDepth = 4,
             ShowHeaders = true,
-            ShowFreeSpace = false,
-            ShowUnknownSpace = false,
+            ShowFreeSpace = true,
+            ShowUnknownSpace = true,
         });
 
         _renderer = new TreemapRenderer(TreemapPalette.Default)
@@ -132,6 +147,17 @@ public sealed class TreemapForm : Control
         _timer = new System.Windows.Forms.Timer { Interval = 16 };
         _timer.Tick += OnTick;
 
+        // One-shot aspect-ratio relayout after a resize burst settles. The camera
+        // refits immediately in SyncViewport; this only re-lays out once the user
+        // stops dragging the window edge, so every pixel does not rebuild the tree.
+        _resizeTimer = new System.Windows.Forms.Timer { Interval = 100 };
+        _resizeTimer.Tick += OnResizeTimerTick;
+
+        // Deferred single click. Fires once when the double-click interval passes
+        // without a second press; a double-click stops it and navigates instead.
+        _clickTimer = new System.Windows.Forms.Timer { Interval = SystemInformation.DoubleClickTime };
+        _clickTimer.Tick += OnClickTimerTick;
+
         _controller.Changed += OnControllerChanged;
         _publisher.Published += OnPublished;
 
@@ -157,10 +183,45 @@ public sealed class TreemapForm : Control
             return;
         }
 
-        // The layout is always the same fixed 1000x1000 content rect, so a resize only
-        // changes the back buffer and refits the camera. Relaying out here would restart
-        // a running transition, and interrupting a tween jumps to the previous target.
+        // A resize refits the back buffer and camera immediately; the content
+        // relayout for the settled aspect ratio follows once the burst stops
+        // (see the one-shot timer below), so every pixel does not rebuild the
+        // tree or restart a running transition.
         SyncViewport();
+        RestartResizeTimer();
+    }
+
+    /// <summary>
+    /// Restarts the one-shot aspect-ratio relayout. Only the last tick after the
+    /// burst rebuilds the tree; every intermediate size just refits the camera.
+    /// </summary>
+    private void RestartResizeTimer()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _resizeTimer.Stop();
+        _resizeTimer.Start();
+    }
+
+    private void OnResizeTimerTick(object? sender, EventArgs e)
+    {
+        _resizeTimer.Stop();
+
+        if (_disposed || !IsHandleCreated)
+        {
+            return;
+        }
+
+        // A resize moves every cell on screen, so a latched click location no
+        // longer means what it did on MouseDown.
+        CancelPendingClick();
+
+        // The camera already refit on every OnResize; this catches the layout up
+        // to the settled aspect ratio without animating.
+        _controller.Relayout(animate: false);
     }
 
     /// <summary>
@@ -245,8 +306,34 @@ public sealed class TreemapForm : Control
 
             using SKCanvas canvas = new(_bitmap);
             canvas.Clear(Background);
-            ApplyCamera(canvas);
-            _renderer.Draw(canvas, _controller.CurrentFrame, _renderState);
+
+            // A filter that matches nothing keeps an empty 0-byte root projection.
+            // The branches are exclusive: either the explicit message alone in
+            // device coordinates, or the map as normal - never the message
+            // painted over the root fill and labels.
+            // Fixed text: the user pattern is unbounded and must not be painted
+            // across the map.
+            if (!string.IsNullOrEmpty(_controller.FilterPattern) && _controller.DisplayFileCount == 0)
+            {
+                using SKTypeface typeface = SKTypeface.FromFamilyName("Segoe UI");
+                using SKFont font = new() { Typeface = typeface, Size = 14 };
+                using SKPaint paint = new()
+                {
+                    Color = SKColors.White,
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Fill,
+                };
+
+                const string message = "No files match the filter.";
+                float x = Math.Max(12, (Width - font.MeasureText(message, paint)) / 2);
+                canvas.DrawText(message, x, Height / 2f, SKTextAlign.Left, font, paint);
+            }
+            else
+            {
+                ApplyCamera(canvas);
+                _renderer.Draw(canvas, _controller.CurrentFrame, _renderState);
+            }
+
             canvas.Flush();
         }
         finally
@@ -276,6 +363,13 @@ public sealed class TreemapForm : Control
     private void OnControllerChanged(ChangeKind kind)
     {
         SyncTimer();
+        // A filter or layout change can alter the hovered folder's totals without
+        // any mouse movement, so refresh the cached tooltip text here too.
+        if ((kind & (ChangeKind.Layout | ChangeKind.Navigation | ChangeKind.Selection | ChangeKind.Hover)) != 0)
+        {
+            UpdateTooltip();
+        }
+
         Invalidate();
     }
 
@@ -381,6 +475,10 @@ public sealed class TreemapForm : Control
             return;
         }
 
+        // The relayout below already lays out at the settled size, so a queued
+        // aspect-ratio tick would only rebuild the same tree twice.
+        _resizeTimer.Stop();
+
         // While a transition is still running, settle onto the newest snapshot
         // without starting another tween: a live scan publishing every few hundred
         // milliseconds would otherwise restart the animation on every preview and
@@ -425,6 +523,36 @@ public sealed class TreemapForm : Control
         switch (e.Button)
         {
             case MouseButtons.Left:
+                // The press latches the hit id from the current frame but starts
+                // no timer while the button is held: holding past the
+                // double-click interval must not select or expand anything.
+                // A fresh single press (Clicks == 1) on a different cell drops
+                // the first latch and keeps the latest hit; the second press of
+                // a double-click arrives with Clicks >= 2 and must preserve the
+                // first latch even when a same-source preview moved a different
+                // node underneath the same coordinates in between.
+                if (_hasPendingClick)
+                {
+                    // A new press supersedes the deferred interval: a clean
+                    // release restarts it, and a double-click cancels it below.
+                    // Stopping here keeps the first timer from firing between
+                    // the second press and its double-click.
+                    _clickTimer.Stop();
+                    if (e.Clicks < 2)
+                    {
+                        int secondHit = HitTestAt(e.X, e.Y);
+                        if (secondHit != _pendingClickId)
+                        {
+                            CancelPendingClick();
+                            LatchPendingClick(e.X, e.Y);
+                        }
+                    }
+                }
+                else
+                {
+                    LatchPendingClick(e.X, e.Y);
+                }
+
                 _dragging = true;
                 _movedWhileDown = false;
                 _dragOrigin = e.Location;
@@ -455,6 +583,10 @@ public sealed class TreemapForm : Control
             if (Math.Abs(e.X - _dragOrigin.X) > ClickSlop || Math.Abs(e.Y - _dragOrigin.Y) > ClickSlop)
             {
                 _movedWhileDown = true;
+
+                // A drag is a pan, not a click: drop the latched press so the
+                // release does not expand anything.
+                CancelPendingClick();
             }
 
             if (dx != 0 || dy != 0)
@@ -486,10 +618,14 @@ public sealed class TreemapForm : Control
             _dragging = false;
             Capture = false;
 
-            // A drag that ended over a different cell must not also select it.
-            if (!_movedWhileDown)
+            // A drag ending elsewhere selects nothing; its latch was already
+            // dropped on move. A clean release starts the deferred-click
+            // interval - selection happens when it fires, not here, so a
+            // double-click can still navigate first.
+            if (!_movedWhileDown && _hasPendingClick && !_disposed)
             {
-                _controller.Click(e.X, e.Y);
+                _clickTimer.Stop();
+                _clickTimer.Start();
             }
         }
     }
@@ -503,15 +639,158 @@ public sealed class TreemapForm : Control
             return;
         }
 
+        // Navigate to the folder the FIRST press latched, not the cursor's
+        // current cell: the first press has not expanded anything yet, so the
+        // layout - and the latched id - are still the ones the user aimed at.
+        // The second press on the same cell kept the first latch; cancel the
+        // deferred timer so the trailing release selects nothing extra.
+        if (!_hasPendingClick)
+        {
+            return;
+        }
+
+        int latchedId = _pendingClickId;
+        string? latchedSource = _pendingSource;
+        string? latchedFilter = _pendingFilter;
+        int latchedFocusRoot = _pendingFocusRoot;
+        CancelPendingClick();
+
         // The second MouseDown already re-armed the drag state; drop it so the trailing
         // MouseUp does not also fire a selection.
         _dragging = false;
         Capture = false;
+        _movedWhileDown = true;
 
-        if (_controller.ZoomIntoHovered())
+        if (latchedId >= 0 && IsPendingValid(latchedId, latchedSource, latchedFilter, latchedFocusRoot))
         {
+            if (_controller.FocusNode(latchedId))
+            {
+                _resizeTimer.Stop();
+                _controller.Relayout(animate: true);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Hit-tests in content space against the frame on screen, so the latched id
+    /// is the cell the user actually aimed at.
+    /// </summary>
+    private int HitTestAt(float x, float y)
+    {
+        PointF content = _controller.Camera.ScreenToContent(new PointF(x, y));
+        return HitTester.HitTestFrameContent(_controller.CurrentFrame, content.X, content.Y);
+    }
+
+    private void LatchPendingClick(float x, float y)
+    {
+        _hasPendingClick = true;
+        _pendingClickId = HitTestAt(x, y);
+        _pendingSource = _publisher.Current.RootPath;
+        _pendingFilter = _controller.FilterPattern;
+        _pendingFocusRoot = _controller.FocusRootNodeId;
+    }
+
+    private void CancelPendingClick()
+    {
+        _clickTimer.Stop();
+        _hasPendingClick = false;
+        _pendingClickId = -1;
+    }
+
+    private void OnClickTimerTick(object? sender, EventArgs e)
+    {
+        FirePendingClick();
+    }
+
+    private void FirePendingClick()
+    {
+        // Never while the button is still held: the timer only starts on a
+        // clean release, and a test hook firing early must not select either.
+        if (!_hasPendingClick || _dragging)
+        {
+            return;
+        }
+
+        int id = _pendingClickId;
+        string? source = _pendingSource;
+        string? filter = _pendingFilter;
+        int focusRoot = _pendingFocusRoot;
+        CancelPendingClick();
+
+        if (_disposed)
+        {
+            return;
+        }
+
+        // A new scan source, filter or navigation since MouseDown means the
+        // latched id may name a different node or nothing at all; drop it
+        // rather than expanding something the user never clicked. Same-source
+        // previews keep stable ids, so the latch survives those as long as the
+        // node still exists in the current display projection - geometry may
+        // have moved meanwhile, but the id still names the same folder.
+        if (!IsPendingValid(id, source, filter, focusRoot))
+        {
+            return;
+        }
+
+        // Fires by latched id, never by stale coordinates: selects the node
+        // (files and blank clicks clear the prior expansion) and temporarily
+        // expands a folder in place. The root, history and camera stay put.
+        // A queued aspect-ratio tick would rebuild the same tree twice, but
+        // only when the click actually changed the expansion and relayouts.
+        // A leaf or blank click leaves the layout alone, so a pending resize
+        // must stay alive to catch the layout up to the new aspect.
+        if (_controller.ExpandNodeTemporarily(id))
+        {
+            _resizeTimer.Stop();
             _controller.Relayout(animate: true);
         }
+    }
+
+    private bool IsPendingValid(int id, string? source, string? filter, int focusRoot)
+    {
+        if (_disposed)
+        {
+            return false;
+        }
+
+        if (!SourcesMatch(_publisher.Current.RootPath, source))
+        {
+            return false;
+        }
+
+        if (!string.Equals(_controller.FilterPattern, filter, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (_controller.FocusRootNodeId != focusRoot)
+        {
+            return false;
+        }
+
+        // A blank press carries no node; it clears the prior selection and
+        // expansion once the source, filter and focus still match.
+        if (id < 0)
+        {
+            return true;
+        }
+
+        return _controller.DisplaySnapshot.TryGetNode(id, out _);
+    }
+
+    private static bool SourcesMatch(string? a, string? b)
+    {
+        if (a is null || b is null)
+        {
+            return a is null && b is null;
+        }
+
+        // Same identity rule as the controller: case-insensitive on Windows,
+        // case-sensitive everywhere else.
+        return OperatingSystem.IsWindows()
+            ? string.Equals(a, b, StringComparison.OrdinalIgnoreCase)
+            : string.Equals(a, b, StringComparison.Ordinal);
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)
@@ -572,9 +851,11 @@ public sealed class TreemapForm : Control
     }
 
     /// <summary>
-    /// Refreshes the hover tooltip from the captured snapshot only: path plus
+    /// Refreshes the hover tooltip from the display projection only: path plus
     /// logical/allocated size, with no filesystem I/O. Rebuilt only when the
-    /// hovered node or the snapshot version changes, not on every mouse event.
+    /// hovered node, the publisher version, the display projection reference or
+    /// the filter changes - applying or clearing a filter alters folder totals
+    /// without publishing anything new.
     /// </summary>
     private void UpdateTooltip()
     {
@@ -585,13 +866,20 @@ public sealed class TreemapForm : Control
 
         int hovered = _controller.HoveredNodeId;
         long version = _publisher.Current.Version;
-        if (hovered == _tooltipNodeId && version == _tooltipVersion)
+        TreemapSnapshot display = _controller.DisplaySnapshot;
+        string filter = _controller.FilterPattern;
+        if (hovered == _tooltipNodeId
+            && version == _tooltipVersion
+            && ReferenceEquals(display, _tooltipSnapshot)
+            && string.Equals(filter, _tooltipFilter, StringComparison.Ordinal))
         {
             return;
         }
 
         _tooltipNodeId = hovered;
         _tooltipVersion = version;
+        _tooltipSnapshot = display;
+        _tooltipFilter = filter;
         _toolTip.SetToolTip(this, hovered >= 0 ? _controller.GetTooltipText(hovered) : string.Empty);
     }
 
@@ -650,6 +938,12 @@ public sealed class TreemapForm : Control
             _timer.Stop();
             _timer.Tick -= OnTick;
             _timer.Dispose();
+            _resizeTimer.Stop();
+            _resizeTimer.Tick -= OnResizeTimerTick;
+            _resizeTimer.Dispose();
+            _clickTimer.Stop();
+            _clickTimer.Tick -= OnClickTimerTick;
+            _clickTimer.Dispose();
             _renderer.Dispose();
             _toolTip.Dispose();
 
@@ -661,4 +955,27 @@ public sealed class TreemapForm : Control
 
         base.Dispose(disposing);
     }
+
+    // ---- state the tests read ----
+
+    internal int PendingClickId => _pendingClickId;
+
+    internal bool HasPendingSingleClick => _hasPendingClick;
+
+    internal bool HasPendingResize => _resizeTimer.Enabled;
+
+    internal bool IsClickTimerRunningForTests => _clickTimer.Enabled;
+
+    internal string TooltipTextForTests => _toolTip.GetToolTip(this) ?? string.Empty;
+
+    /// <summary>
+    /// Fires the deferred single click synchronously, so tests do not wait out
+    /// the real double-click interval. No-op while the button is still held.
+    /// </summary>
+    internal void FirePendingClickForTests() => FirePendingClick();
+
+    /// <summary>
+    /// Fires the coalesced aspect-ratio relayout synchronously.
+    /// </summary>
+    internal void FirePendingResizeForTests() => OnResizeTimerTick(this, EventArgs.Empty);
 }

@@ -58,7 +58,15 @@ public readonly record struct ScanProgress(
     ScanPhase Phase,
     string? CurrentPath,
     long EntriesScanned,
-    long BytesScanned);
+    long BytesScanned)
+{
+    /// <summary>
+    /// Discovered-storage estimate for whole-volume scans, 0 to 99 until
+    /// <see cref="ScanPhase.Finished"/> reports 100. Null means unknown: folder scans
+    /// or unavailable capacity. A zero used-byte total reports 0, never null.
+    /// </summary>
+    public int? PercentComplete { get; init; }
+}
 
 /// <summary>One bounded, human-readable note about something the scan could not do exactly.</summary>
 /// <param name="Severity">How much the note matters.</param>

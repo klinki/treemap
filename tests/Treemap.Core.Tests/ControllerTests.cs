@@ -87,8 +87,8 @@ public class ControllerTests
         float before = controller.Camera.Zoom;
         controller.WheelZoom(1, 400, 300);
 
-        // Content is laid out into a fixed 1000x1000 reference rect, so zoom starts
-        // near the "fitted" value and scrolling up genuinely zooms in.
+        // Content uses reference height 1000 with aspect-matched width, so zoom
+        // starts near the "fitted" value and scrolling up genuinely zooms in.
         Assert.True(controller.Camera.Zoom > before, "scrolling up should zoom in");
 
         ChangeKind changes = controller.ConsumeChanges();
@@ -117,14 +117,36 @@ public class ControllerTests
     [Fact]
     public void ClickSelectsNode()
     {
+        // Click a real leaf cell so selection lands on content rather than a
+        // space block (which hit-testing skips) or a blank margin. A folder
+        // bounds center hits its deepest visible child, so folders are not
+        // clickable by bounds center without headers.
         TreemapController controller = NewController(out _);
         controller.ConsumeChanges();
 
-        controller.Click(400, 300);
+        PointF at = ScreenCenterOf(controller, 2);
+        controller.Click(at.X, at.Y);
 
         ChangeKind changes = controller.ConsumeChanges();
         Assert.True(changes.HasFlag(ChangeKind.Selection));
-        Assert.True(controller.SelectedNodeId != 0);
+        Assert.Equal(2, controller.SelectedNodeId);
+    }
+
+    private static PointF ScreenCenterOf(TreemapController controller, int nodeId)
+    {
+        foreach (TweenedCell cell in controller.CurrentFrame)
+        {
+            if (cell.NodeId == nodeId)
+            {
+                PointF centre = new(
+                    cell.Bounds.X + cell.Bounds.Width / 2,
+                    cell.Bounds.Y + cell.Bounds.Height / 2);
+                return controller.Camera.ContentToScreen(centre);
+            }
+        }
+
+        Assert.Fail($"node {nodeId} is not in the frame");
+        return default;
     }
 
     [Fact]
@@ -216,9 +238,9 @@ public class ControllerTests
     [Fact]
     public void FittedZoomStaysNearUnity()
     {
-        // Regression guard: the content rect is a fixed 1000x1000 reference, so a
-        // fitted camera sits near zoom 1.0. An earlier 1x1 content rect scaled the
-        // zoom to hundreds and pinned it against MaxZoom.
+        // Regression guard: the content rect uses reference height 1000 with
+        // aspect-matched width, so a fitted camera sits near zoom 1.0. An earlier
+        // 1x1 content rect scaled the zoom to hundreds and pinned it against MaxZoom.
         TreemapController controller = NewController(out _);
 
         Assert.InRange(controller.Camera.Zoom, 0.2f, 2.0f);
@@ -373,9 +395,10 @@ public class ControllerTests
         publisher.Publish(changed);
         controller.Relayout(animate: true);
 
-        // The controller lays out into a fixed 1000x1000 reference rect, so the
+        // The controller lays out into its aspect-aware content rect, so the
         // target can be reproduced exactly here.
-        LayoutResult target = SquarifyLayout.Compute(changed, new RectF(0, 0, 1000, 1000));
+        LayoutResult target = SquarifyLayout.Compute(
+            changed, TreemapController.ContentBoundsFor(new RectF(0, 0, 800, 600)));
 
         RectF onScreen = FrameBoundsOf(controller.CurrentFrame, 2);
         RectF targetRect = LayoutBoundsOf(target, 2);

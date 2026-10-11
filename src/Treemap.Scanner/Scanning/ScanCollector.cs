@@ -159,6 +159,14 @@ internal sealed class ScanCollector
         }
     }
 
+    /// <summary>
+    /// Cached used-byte total for volume progress. Set once before enumeration; null
+    /// means unknown. <see cref="Report"/> returns 100 for <see cref="ScanPhase.Finished"/>
+    /// regardless, null for an unavailable total, 0 for an empty used-byte total,
+    /// otherwise 0..99.
+    /// </summary>
+    public long? UsedBytesForProgress { get; set; }
+
     /// <summary>False as soon as anything failed, was truncated or was approximated.</summary>
     public bool IsComplete
     {
@@ -325,7 +333,9 @@ internal sealed class ScanCollector
             return;
         }
 
-        ScanProgress tick;
+        long entries;
+        long logical;
+        long represented;
 
         lock (_gate)
         {
@@ -336,8 +346,48 @@ internal sealed class ScanCollector
             }
 
             _nextReportAt = now + (long)_options.ProgressInterval.TotalMilliseconds;
-            tick = new ScanProgress(phase, currentPath, _entries.Count, _logicalBytes);
+            entries = _entries.Count;
+            logical = _logicalBytes;
+            represented = _representedBytes;
         }
+
+        // Computed outside the gate from the captured count and the cached used
+        // total, so no tick touches capacity or the disk.
+        int? percent;
+        if (phase == ScanPhase.Finished)
+        {
+            percent = 100;
+        }
+        else
+        {
+            long? used = UsedBytesForProgress;
+            if (used is null)
+            {
+                percent = null;
+            }
+            else if (used <= 0)
+            {
+                percent = 0;
+            }
+            else
+            {
+                double ratio = (double)represented * 100.0 / (double)used.Value;
+                if (double.IsNaN(ratio) || ratio < 0)
+                {
+                    percent = 0;
+                }
+                else if (ratio >= 100)
+                {
+                    percent = 99;
+                }
+                else
+                {
+                    percent = (int)ratio;
+                }
+            }
+        }
+
+        ScanProgress tick = new(phase, currentPath, entries, logical) { PercentComplete = percent };
 
         progress.Report(tick);
     }

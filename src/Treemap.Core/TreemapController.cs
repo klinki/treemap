@@ -1,3 +1,5 @@
+using System.IO.Enumeration;
+
 namespace Treemap;
 
 /// <summary>What changed since the last poll, so the host knows whether to repaint.</summary>
@@ -57,7 +59,19 @@ public sealed class TreemapController
 
     private int _tooltipNodeId = -1;
     private long _tooltipVersion = -1;
+    private string _tooltipFilter = string.Empty;
     private string? _tooltipText;
+
+    private string _filterPattern = string.Empty;
+    private TreemapSnapshot? _displaySource;
+    private string _displayFilter = string.Empty;
+    private TreemapSnapshot? _displayCache;
+    private long _displayFileCount;
+
+    private int _temporaryExpandedNodeId = -1;
+
+    /// <summary>Extra descendant levels granted to the temporarily expanded branch.</summary>
+    private const int TemporaryExtraLevels = 2;
 
     public TreemapController(
         SnapshotPublisher publisher, LayoutOptions? options = null, TimeProvider? timeProvider = null)
@@ -65,11 +79,11 @@ public sealed class TreemapController
         ArgumentNullException.ThrowIfNull(publisher);
 
         _publisher = publisher;
-        _options = options ?? LayoutOptions.Default;
+        _options = WithoutTemporary(options ?? LayoutOptions.Default);
         _animator = new TreemapAnimator(timeProvider: timeProvider);
         _focusRootNodeId = publisher.Current.Root.Id;
         _focusSource = publisher.Current.RootPath;
-        _camera.FitToContent(ContentBounds, _viewport);
+        _camera.FitToContent(ContentBounds, _viewport, FitMargin);
     }
 
     /// <summary>
@@ -117,12 +131,17 @@ public sealed class TreemapController
     {
         get
         {
+            if (_temporaryExpandedNodeId >= 0)
+            {
+                return true;
+            }
+
             if (_forwardStack.Count > 0)
             {
                 return true;
             }
 
-            if (_focusRootNodeId != _publisher.Current.Root.Id)
+            if (_focusRootNodeId != DisplaySnapshot.Root.Id)
             {
                 return true;
             }
@@ -136,7 +155,7 @@ public sealed class TreemapController
     {
         get
         {
-            TreemapSnapshot snapshot = _publisher.Current;
+            TreemapSnapshot snapshot = DisplaySnapshot;
             return snapshot.TryGetNode(_focusRootNodeId, out _)
                 && snapshot.TryGetParent(_focusRootNodeId, out _);
         }
@@ -152,20 +171,44 @@ public sealed class TreemapController
     }
 
     /// <summary>
-    /// The rect the treemap is laid out into, in content coordinates. This is a
-    /// fixed reference size (not the viewport), so the camera's zoom of 1.0 means
-    /// "fitted to the window" regardless of window size. Zoom values therefore stay
-    /// in a human-sensible range near 1.0 instead of being scaled by viewport pixels.
+    /// The rect the treemap is laid out into, in content coordinates. The height is
+    /// a fixed reference size while the width follows the current viewport aspect,
+    /// so a fitted camera (margin 1) fills wide and portrait windows instead of
+    /// letterboxing a square. Zoom 1.0 still means "fitted to the window".
     /// </summary>
-    private static RectF ContentBounds => new(0, 0, ReferenceSize, ReferenceSize);
+    private RectF ContentBounds => ContentBoundsFor(_viewport);
 
-    /// <summary>Reference layout size in content units.</summary>
-    private const float ReferenceSize = 1000f;
+    /// <summary>Reference layout height in content units; width follows the viewport.</summary>
+    private const float ReferenceHeight = 1000f;
+
+    /// <summary>Camera fit margin, close to 1 so the map fills the viewport.</summary>
+    private const float FitMargin = 1f;
+
+    /// <summary>
+    /// Content rect for a viewport: reference height with matching reference width.
+    /// Empty viewports fall back to the 1000x1000 square.
+    /// </summary>
+    public static RectF ContentBoundsFor(RectF viewport)
+    {
+        if (viewport.IsEmpty || viewport.Height <= 0f || viewport.Width <= 0f)
+        {
+            return new RectF(0, 0, ReferenceHeight, ReferenceHeight);
+        }
+
+        float width = ReferenceHeight * viewport.Width / viewport.Height;
+        if (!(width > 0f) || float.IsNaN(width) || float.IsInfinity(width))
+        {
+            return new RectF(0, 0, ReferenceHeight, ReferenceHeight);
+        }
+
+        return new RectF(0, 0, width, ReferenceHeight);
+    }
 
     /// <summary>
     /// Sets the viewport size. The camera refits whenever the size changes, so the
-    /// treemap always fills the window. Call <see cref="Relayout"/> afterwards if
-    /// the caller also wants the content re-laid out.
+    /// treemap always fills the window. The host debounces the matching aspect-ratio
+    /// relayout and calls <see cref="Relayout"/> once the size settles; this method
+    /// never rebuilds the tree itself.
     /// </summary>
     public void SetViewport(in RectF viewport)
     {
@@ -178,58 +221,202 @@ public sealed class TreemapController
 
         if (!viewport.IsEmpty)
         {
-            _camera.FitToContent(ContentBounds, viewport);
+            _camera.FitToContent(ContentBounds, viewport, FitMargin);
             Raise(ChangeKind.Camera);
         }
     }
 
+    /// <summary>Active filename filter, or empty when no filter applies.</summary>
+    public string FilterPattern => _filterPattern;
+
     /// <summary>
-    /// Re-lays out the current snapshot. Called after a publish or option change.
+    /// Projected snapshot the map displays: the published tree filtered by
+    /// <see cref="FilterPattern"/>, or the published snapshot itself when clear.
+    /// Cached by source reference and normalized expression; rebuilt per preview.
+    /// </summary>
+    public TreemapSnapshot DisplaySnapshot
+    {
+        get
+        {
+            if (_filterPattern.Length == 0)
+            {
+                return _publisher.Current;
+            }
+
+            EnsureDisplayCache();
+            return _displayCache ?? _publisher.Current;
+        }
+    }
+
+    /// <summary>Matching file count over the display projection.</summary>
+    public long DisplayFileCount
+    {
+        get
+        {
+            if (_filterPattern.Length == 0)
+            {
+                EnsureUnfilteredCount();
+                return _displayFileCount;
+            }
+
+            EnsureDisplayCache();
+            return _displayFileCount;
+        }
+    }
+
+    /// <summary>Folder temporarily showing extra levels in place, or -1.</summary>
+    public int TemporaryExpandedNodeId => _temporaryExpandedNodeId;
+
+    /// <summary>
+    /// Sets the filename filter. Blank or <c>*</c> clears it. Filename glob with
+    /// <c>*</c> and <c>?</c>, case-insensitive on basenames only. Returns whether
+    /// the normalized filter changed; the caller relayouts as with option changes.
+    /// </summary>
+    public bool ApplyFileFilter(string? pattern)
+    {
+        string normalized = NormalizeFilter(pattern);
+        if (string.Equals(normalized, _filterPattern, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        _filterPattern = normalized;
+        _temporaryExpandedNodeId = -1;
+        _tooltipNodeId = -1;
+        _tooltipVersion = -1;
+        _tooltipFilter = string.Empty;
+        _tooltipText = null;
+        TreemapSnapshot display = DisplaySnapshot;
+        ChangeKind kind = ChangeKind.Layout | ChangeKind.Selection;
+        if (_selectedNodeId >= 0 && !display.TryGetNode(_selectedNodeId, out _))
+        {
+            _selectedNodeId = -1;
+        }
+
+        if (_hoveredNodeId >= 0 && !display.TryGetNode(_hoveredNodeId, out _))
+        {
+            _hoveredNodeId = -1;
+            kind |= ChangeKind.Hover;
+        }
+
+        Raise(kind);
+        return true;
+    }
+
+    /// <summary>
+    /// Selects <paramref name="nodeId"/> and grants its branch two extra levels.
+    /// Files and blank (-1) clear the prior expansion. Returns whether the
+    /// expansion changed, in which case the caller relayouts.
+    /// </summary>
+    public bool ExpandNodeTemporarily(int nodeId)
+    {
+        TreemapSnapshot display = DisplaySnapshot;
+        int requested = nodeId >= 0 && display.TryGetNode(nodeId, out _) ? nodeId : -1;
+        bool isFolder = requested >= 0
+            && display.TryGetNode(requested, out TreemapNode? node)
+            && node.Children.Count > 0;
+        int next = isFolder ? requested : -1;
+
+        if (requested != _selectedNodeId)
+        {
+            _selectedNodeId = requested;
+            Raise(ChangeKind.Selection);
+        }
+
+        if (next == _temporaryExpandedNodeId)
+        {
+            return false;
+        }
+
+        _temporaryExpandedNodeId = next;
+        return true;
+    }
+
+    /// <summary>
+    /// Re-lays out the display projection. Called after a publish or option change.
     /// The focused subtree is used as the layout root, so drilling into a folder
-    /// re-lays out that folder's contents across the whole content rect.
+    /// re-lays out that folder's contents across the aspect-aware content rect.
     /// A changed source <see cref="TreemapSnapshot.RootPath"/> resets
-    /// focus/selection/hover/camera/history and the tooltip cache, so a new scan
-    /// never lands on a coincidentally reused id; same-source previews keep focus.
-    /// Otherwise stale history entries are pruned, and a focus that no longer
-    /// exists resets to the snapshot root.
+    /// focus/selection/hover/camera/history/temporary expansion and the tooltip cache,
+    /// so a new scan never lands on a coincidentally reused id; same-source previews
+    /// keep focus and retain a still-valid temporary expansion.
+    /// Focus, parents and history resolve against the display projection, so a
+    /// filtered-out focus safely resets to the display root.
     /// </summary>
     public void Relayout(bool animate = true)
     {
-        TreemapSnapshot snapshot = _publisher.Current;
+        TreemapSnapshot source = _publisher.Current;
 
-        if (!SourcesMatch(_focusSource, snapshot.RootPath))
+        if (!SourcesMatch(_focusSource, source.RootPath))
         {
-            _focusSource = snapshot.RootPath;
-            _focusRootNodeId = snapshot.Root.Id;
+            _focusSource = source.RootPath;
+            _temporaryExpandedNodeId = -1;
+            _displaySource = null;
+            _displayCache = null;
+            TreemapSnapshot display = DisplaySnapshot;
+            _focusRootNodeId = display.Root.Id;
             _backStack.Clear();
             _forwardStack.Clear();
             _hoveredNodeId = -1;
             _selectedNodeId = -1;
             _tooltipNodeId = -1;
             _tooltipVersion = -1;
+            _tooltipFilter = string.Empty;
             _tooltipText = null;
             _camera.Reset();
-            _camera.FitToContent(ContentBounds, _viewport);
+            _camera.FitToContent(ContentBounds, _viewport, FitMargin);
             Raise(ChangeKind.Navigation | ChangeKind.Camera | ChangeKind.Hover | ChangeKind.Selection);
         }
         else
         {
-            PruneHistory(snapshot);
+            TreemapSnapshot display = DisplaySnapshot;
+            PruneHistory(display);
 
-            if (!snapshot.TryGetNode(_focusRootNodeId, out _))
+            if (!display.TryGetNode(_focusRootNodeId, out _))
             {
-                _focusRootNodeId = snapshot.Root.Id;
+                _focusRootNodeId = display.Root.Id;
                 _backStack.Clear();
                 _forwardStack.Clear();
                 _camera.Reset();
-                _camera.FitToContent(ContentBounds, _viewport);
+                _camera.FitToContent(ContentBounds, _viewport, FitMargin);
+            }
+
+            if (_temporaryExpandedNodeId >= 0
+                && (!display.TryGetNode(_temporaryExpandedNodeId, out TreemapNode? expanded)
+                    || expanded.Children.Count == 0))
+            {
+                _temporaryExpandedNodeId = -1;
+            }
+
+            ChangeKind pruned = ChangeKind.None;
+            if (_selectedNodeId >= 0 && !display.TryGetNode(_selectedNodeId, out _))
+            {
+                _selectedNodeId = -1;
+                pruned |= ChangeKind.Selection;
+            }
+
+            if (_hoveredNodeId >= 0 && !display.TryGetNode(_hoveredNodeId, out _))
+            {
+                _hoveredNodeId = -1;
+                pruned |= ChangeKind.Hover;
+            }
+
+            if (pruned != ChangeKind.None)
+            {
+                Raise(pruned);
             }
         }
 
-        snapshot.TryGetNode(_focusRootNodeId, out TreemapNode? focusNode);
-        focusNode ??= snapshot.Root;
+        TreemapSnapshot current = DisplaySnapshot;
+        current.TryGetNode(_focusRootNodeId, out TreemapNode? focusNode);
+        focusNode ??= current.Root;
 
-        LayoutResult next = SquarifyLayout.Compute(focusNode, ContentBounds, _options);
+        LayoutOptions effective = _temporaryExpandedNodeId >= 0
+            ? WithoutTemporary(_options).With(
+                temporaryExpandedNodeId: _temporaryExpandedNodeId,
+                temporaryExtraDepth: TemporaryExtraLevels)
+            : WithoutTemporary(_options);
+        LayoutResult next = SquarifyLayout.Compute(focusNode, ContentBounds, effective);
 
         if (animate && !_layout.IsEmpty)
         {
@@ -280,15 +467,17 @@ public sealed class TreemapController
         }
     }
 
-    /// <summary>Handles a left click: select, or drill into a folder on double-click.</summary>
+    /// <summary>
+    /// Handles a left click: selects the cell under the cursor and temporarily
+    /// expands a clicked folder two levels in place. The displayed root, camera
+    /// and history never change. Relayouts once when the expansion changed.
+    /// </summary>
     public void Click(float x, float y)
     {
         int hit = HitAt(x, y);
-
-        if (hit != _selectedNodeId)
+        if (ExpandNodeTemporarily(hit))
         {
-            _selectedNodeId = hit;
-            Raise(ChangeKind.Selection);
+            Relayout(animate: false);
         }
     }
 
@@ -324,6 +513,7 @@ public sealed class TreemapController
     /// stack and clearing forward history. Only nodes with children can be focused;
     /// focusing the already-focused node is a no-op. The newly focused subtree is
     /// fitted to the viewport; the previous camera is kept in history.
+    /// Clears any temporary in-place expansion. Resolves against the display projection.
     /// </summary>
     public bool FocusNode(int nodeId)
     {
@@ -332,7 +522,7 @@ public sealed class TreemapController
             return false;
         }
 
-        TreemapSnapshot snapshot = _publisher.Current;
+        TreemapSnapshot snapshot = DisplaySnapshot;
         if (!snapshot.TryGetNode(nodeId, out TreemapNode node) || node.Children.Count == 0)
         {
             return false;
@@ -341,20 +531,22 @@ public sealed class TreemapController
         PushBack();
         _forwardStack.Clear();
         _focusRootNodeId = nodeId;
+        _temporaryExpandedNodeId = -1;
         _camera.Reset();
-        _camera.FitToContent(ContentBounds, _viewport);
+        _camera.FitToContent(ContentBounds, _viewport, FitMargin);
         Raise(ChangeKind.Navigation | ChangeKind.Camera);
         return true;
     }
 
     /// <summary>
-    /// Moves one level to the true parent resolved from the whole snapshot, not
+    /// Moves one level to the true parent resolved from the display projection, not
     /// from the current focused layout or the history stack. Branches: forward
     /// history is cleared. The parent subtree is fitted to the viewport.
+    /// Clears any temporary in-place expansion.
     /// </summary>
     public bool GoToParent()
     {
-        TreemapSnapshot snapshot = _publisher.Current;
+        TreemapSnapshot snapshot = DisplaySnapshot;
         if (!snapshot.TryGetNode(_focusRootNodeId, out _)
             || !snapshot.TryGetParent(_focusRootNodeId, out int parentId))
         {
@@ -364,8 +556,9 @@ public sealed class TreemapController
         PushBack();
         _forwardStack.Clear();
         _focusRootNodeId = parentId;
+        _temporaryExpandedNodeId = -1;
         _camera.Reset();
-        _camera.FitToContent(ContentBounds, _viewport);
+        _camera.FitToContent(ContentBounds, _viewport, FitMargin);
         Raise(ChangeKind.Navigation | ChangeKind.Camera);
         return true;
     }
@@ -383,6 +576,7 @@ public sealed class TreemapController
         _backStack.RemoveAt(_backStack.Count - 1);
 
         _focusRootNodeId = entry.FocusRootNodeId;
+        _temporaryExpandedNodeId = -1;
         _camera.Apply(entry.Camera);
         Raise(ChangeKind.Navigation);
         return true;
@@ -401,6 +595,7 @@ public sealed class TreemapController
         _forwardStack.RemoveAt(_forwardStack.Count - 1);
 
         _focusRootNodeId = entry.FocusRootNodeId;
+        _temporaryExpandedNodeId = -1;
         _camera.Apply(entry.Camera);
         Raise(ChangeKind.Navigation);
         return true;
@@ -409,24 +604,27 @@ public sealed class TreemapController
     /// <summary>
     /// Resets the view to the whole drive, refitting the camera even when already
     /// at the root. Branches: forward history is cleared. Returns false when
-    /// already home with a fitted camera and empty forward history.
+    /// already home with a fitted camera, empty forward history and no temporary
+    /// detail. Clears any temporary in-place expansion.
+    /// The caller relayouts afterwards when temporary detail was cleared.
     /// </summary>
     public bool GoToRoot()
     {
-        TreemapSnapshot snapshot = _publisher.Current;
+        TreemapSnapshot snapshot = DisplaySnapshot;
         int rootId = snapshot.Root.Id;
 
         if (_focusRootNodeId == rootId)
         {
             bool fitted = !IsCameraOffFit();
-            if (_forwardStack.Count == 0 && fitted)
+            if (_forwardStack.Count == 0 && fitted && _temporaryExpandedNodeId < 0)
             {
                 return false;
             }
 
             _forwardStack.Clear();
+            _temporaryExpandedNodeId = -1;
             _camera.Reset();
-            _camera.FitToContent(ContentBounds, _viewport);
+            _camera.FitToContent(ContentBounds, _viewport, FitMargin);
             Raise(ChangeKind.Navigation | ChangeKind.Camera);
             return true;
         }
@@ -434,8 +632,9 @@ public sealed class TreemapController
         PushBack();
         _forwardStack.Clear();
         _focusRootNodeId = rootId;
+        _temporaryExpandedNodeId = -1;
         _camera.Reset();
-        _camera.FitToContent(ContentBounds, _viewport);
+        _camera.FitToContent(ContentBounds, _viewport, FitMargin);
         Raise(ChangeKind.Navigation | ChangeKind.Camera);
         return true;
     }
@@ -469,11 +668,14 @@ public sealed class TreemapController
     }
 
     /// <summary>Replaces the layout options. The caller relayouts afterwards.</summary>
+    /// <remarks>Any temporary-expansion fields on <paramref name="options"/> are
+    /// stripped: only the controller's own <see cref="TemporaryExpandedNodeId"/>
+    /// drives the override, so clearing it cannot leave external values behind.</remarks>
     public void SetLayoutOptions(LayoutOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        _options = options;
+        _options = WithoutTemporary(options);
         Raise(ChangeKind.Layout);
     }
 
@@ -494,15 +696,19 @@ public sealed class TreemapController
     }
 
     /// <summary>
-    /// Tooltip text for a node: its snapshot path plus logical/allocated size.
-    /// Read from the captured snapshot only, never the filesystem, and cached per
-    /// node and snapshot version so mouse movement does not rebuild the path.
+    /// Tooltip text for a node: its display path plus logical/allocated size.
+    /// Read from the display projection only, never the filesystem, and cached per
+    /// node, snapshot version and filter so mouse movement does not rebuild the path.
     /// </summary>
     public string GetTooltipText(int nodeId)
     {
-        TreemapSnapshot snapshot = _publisher.Current;
+        TreemapSnapshot source = _publisher.Current;
+        TreemapSnapshot snapshot = DisplaySnapshot;
 
-        if (nodeId == _tooltipNodeId && snapshot.Version == _tooltipVersion && _tooltipText is not null)
+        if (nodeId == _tooltipNodeId
+            && source.Version == _tooltipVersion
+            && string.Equals(_filterPattern, _tooltipFilter, StringComparison.Ordinal)
+            && _tooltipText is not null)
         {
             return _tooltipText;
         }
@@ -517,7 +723,8 @@ public sealed class TreemapController
         }
 
         _tooltipNodeId = nodeId;
-        _tooltipVersion = snapshot.Version;
+        _tooltipVersion = source.Version;
+        _tooltipFilter = _filterPattern;
         _tooltipText = text;
         return text;
     }
@@ -583,6 +790,159 @@ public sealed class TreemapController
             : string.Equals(a, b, StringComparison.Ordinal);
     }
 
+    private static string NormalizeFilter(string? pattern)
+    {
+        if (string.IsNullOrWhiteSpace(pattern))
+        {
+            return string.Empty;
+        }
+
+        string trimmed = pattern.Trim();
+        if (trimmed.Length == 0 || trimmed == "*")
+        {
+            return string.Empty;
+        }
+
+        return trimmed;
+    }
+
+    private void EnsureUnfilteredCount()
+    {
+        TreemapSnapshot source = _publisher.Current;
+        if (ReferenceEquals(_displaySource, source) && _displayFilter.Length == 0 && _filterPattern.Length == 0)
+        {
+            return;
+        }
+
+        _displaySource = source;
+        _displayFilter = string.Empty;
+        _displayCache = null;
+        _displayFileCount = CountFiles(source.Root);
+    }
+
+    private void EnsureDisplayCache()
+    {
+        TreemapSnapshot source = _publisher.Current;
+        if (ReferenceEquals(_displaySource, source)
+            && string.Equals(_displayFilter, _filterPattern, StringComparison.Ordinal)
+            && _displayCache is not null)
+        {
+            return;
+        }
+
+        (TreemapNode Root, long FileCount) projected = ProjectForFilter(source.Root, _filterPattern);
+        _displayCache = new TreemapSnapshot(
+            projected.Root, source.Version, source.Timestamp, source.RootPath);
+        _displaySource = source;
+        _displayFilter = _filterPattern;
+        _displayFileCount = projected.FileCount;
+    }
+
+    private static long CountFiles(TreemapNode root)
+    {
+        long count = 0;
+        Stack<TreemapNode> stack = new();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            TreemapNode node = stack.Pop();
+            if (node.Kind == NodeKind.File)
+            {
+                count++;
+            }
+            else
+            {
+                foreach (TreemapNode child in node.Children)
+                {
+                    stack.Push(child);
+                }
+            }
+        }
+
+        return count;
+    }
+
+    private static (TreemapNode Root, long FileCount) ProjectForFilter(TreemapNode root, string pattern)
+    {
+        long files = 0;
+        TreemapNode? projected = ProjectNode(root, pattern, isRoot: true, ref files);
+        projected ??= TreemapNode.Create(
+            root.Id, root.Name, root.Kind, 0, 0, root.LastWriteTime, root.ColorGroup);
+        return (projected, files);
+    }
+
+    private static TreemapNode? ProjectNode(TreemapNode node, string pattern, bool isRoot, ref long files)
+    {
+        if (node.IsSpace)
+        {
+            return null;
+        }
+
+        if (node.Kind == NodeKind.File)
+        {
+            if (!GlobMatches(node.Name, pattern))
+            {
+                return null;
+            }
+
+            files++;
+            return node;
+        }
+
+        List<TreemapNode>? kept = null;
+        long logical = 0;
+        long physical = 0;
+        foreach (TreemapNode child in node.Children)
+        {
+            TreemapNode? match = ProjectNode(child, pattern, isRoot: false, ref files);
+            if (match is null)
+            {
+                continue;
+            }
+
+            kept ??= [];
+            kept.Add(match);
+            logical = AddSaturating(logical, match.LogicalSize);
+            physical = AddSaturating(physical, match.PhysicalSize);
+        }
+
+        if (kept is null)
+        {
+            return isRoot ? TreemapNode.Create(
+                node.Id, node.Name, node.Kind, 0, 0, node.LastWriteTime, node.ColorGroup) : null;
+        }
+
+        return TreemapNode.Create(
+            node.Id, node.Name, node.Kind, logical, physical,
+            node.LastWriteTime, node.ColorGroup, kept);
+    }
+
+    private static long AddSaturating(long a, long b)
+    {
+        if (b > 0 && a > long.MaxValue - b)
+        {
+            return long.MaxValue;
+        }
+
+        return a + b;
+    }
+
+    /// <summary>
+    /// Filename glob with <c>*</c> (any run) and <c>?</c> (one char),
+    /// case-insensitive, basename only. Uses the framework matcher.
+    /// </summary>
+    private static bool GlobMatches(string name, string pattern)
+        => FileSystemName.MatchesSimpleExpression(pattern, name, ignoreCase: true);
+
+    /// <summary>
+    /// Returns options without any temporary-expansion override, copying when
+    /// needed so the shared <see cref="LayoutOptions.Default"/> is never mutated.
+    /// </summary>
+    private static LayoutOptions WithoutTemporary(LayoutOptions options)
+        => options.TemporaryExpandedNodeId == -1 && options.TemporaryExtraDepth == 0
+            ? options
+            : options.With(temporaryExpandedNodeId: -1, temporaryExtraDepth: 0);
+
     /// <summary>True when the camera differs from a fresh fit of the viewport.</summary>
     private bool IsCameraOffFit()
     {
@@ -592,7 +952,7 @@ public sealed class TreemapController
         }
 
         TreemapCamera fitted = new();
-        fitted.FitToContent(ContentBounds, _viewport);
+        fitted.FitToContent(ContentBounds, _viewport, FitMargin);
         const float zoomTol = 1e-4f;
         const float panTol = 0.5f;
         return MathF.Abs(_camera.Zoom - fitted.Zoom) > zoomTol

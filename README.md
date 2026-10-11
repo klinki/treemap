@@ -83,6 +83,13 @@ immutable previews while scanning. `SnapshotInterval` defaults to 500 ms, with a
 10 ms scheduling floor. Preview construction is serialized and skips unchanged
 entry sets. The desktop enables previews by default.
 
+For whole-volume scans with capacity available, the first preview contains free
+space and the full unaccounted used space before enumeration begins. Discovered
+files replace that residual in later previews. The desktop progress bar reports
+discovered storage as a fraction of used volume bytes, capped at 99% until the scan
+finishes. This estimates storage coverage, not remaining scan time. Folder scans
+and unavailable capacity use indeterminate progress.
+
 With previews enabled, cancellation or failure restores the previous tree and its
 source path after draining any preview in progress. Abandoning an NTFS attempt
 discards its previews before portable enumeration starts. Without previews,
@@ -135,6 +142,9 @@ The desktop reserves folder headers above their children and shows names and siz
 inside visible cells. Hover highlights the node and its ancestor headers. The
 tooltip shows the absolute path and logical or allocated size from the snapshot.
 
+- Single-click a folder to show two extra levels inside its current rectangle.
+  The displayed root stays in place. Selecting another node returns the previous
+  subtree to the global detail level.
 - Double-click a folder to focus its subtree. Back and Forward restore previous
   focus and camera positions. Up moves to the actual parent; Home returns to the
   scan root and fits the camera.
@@ -144,15 +154,25 @@ tooltip shows the absolute path and logical or allocated size from the snapshot.
 - More detail and Less detail change visible descendant depth from 1 to 64 without
   rescanning or changing zoom. The desktop starts at depth 4.
 - Free space and Unaccounted space independently show green and gray blocks.
-  Both start hidden. Toggling them reflows the map while preserving scan data and
+  Both start visible. Toggling them reflows the map while preserving scan data and
   totals.
+- Apply a filename filter such as `*.mp4` with Apply or Enter. `*` and `?` match
+  filenames without regard to case. Matching files retain their ancestor folders,
+  whose displayed logical and allocated totals are recalculated. Clear or a blank
+  filter restores the original tree. Active filters omit volume-space blocks;
+  clearing restores the user's space visibility choices. Filtering never rescans.
 
 Navigation history resets when a new source is scanned. Same-source previews keep
-the current focus where it still exists. Resizing refits the camera without rebuilding
-the layout, and the frame timer stops when animation settles.
+the current focus where it still exists, and active filters apply to each preview.
+The map follows the viewport's proportions to fill wide and portrait windows.
+Resizing refits the camera immediately and debounces the geometry rebuild until
+the size settles. The frame timer stops when animation settles.
 
 See the [reference interaction plan](docs/features/reference-interactions/implementation-plan.md)
 and [verification evidence](docs/features/reference-interactions/verification.md).
+The [scan exploration plan](docs/features/scan-exploration/implementation-plan.md)
+and [review evidence](docs/features/scan-exploration/verification.md) cover the
+progress, filtering, and click behavior updates.
 
 ## One real benchmark
 
@@ -184,14 +204,15 @@ allocations is invisible to it.
 
 ## Verification (2026-10-11)
 
-All 458 runnable tests passed in Release, including 42 hidden WinForms tests.
+All 548 runnable tests passed in Release, including 78 hidden WinForms tests.
 Five scanner tests were explicitly skipped because of platform or symbolic-link
 permissions. All 11 projects built with zero warnings and errors. The final full
-test run completed in 26.4 seconds and its process tree peaked at 132.7 MiB committed
-memory. Builds, tests, and rendering fixtures used the bounded runner. Seven hidden
-window fixtures covered headers, labels, drill-down, detail levels, space blocks,
-hover, and toolbar wrapping. See the
-[reference interaction evidence](docs/features/reference-interactions/verification.md).
+test run completed in 29.0 seconds and its process tree peaked at 149.5 MiB committed
+memory. Builds, tests, and rendering fixtures used the bounded runner. Eleven hidden
+window fixtures covered initial and discovered space, full-width and portrait
+layouts, temporary detail, folder focus, filename filtering, no matches, and narrow
+toolbar and filter wrapping. See the
+[scan exploration evidence](docs/features/scan-exploration/verification.md).
 
 Earlier real-directory checks verified publication, stable IDs, limits, cancellation,
 and Windows access-denied fallback. See the
@@ -206,14 +227,12 @@ for `Layout10K`: mean
 three measured iterations. The 99.9% confidence interval is wide (0.671–1.682 ms);
 this is an initial measurement under the stated caps. The complete benchmark process
 tree peaked at 280.1 MiB. Other benchmark cases remain unmeasured. No benchmark was
-rerun for the scanner or reference interaction changes.
+rerun for the scanner, reference interaction, or scan exploration changes.
 
 Logs are in `artifacts/verification/`; workload results are in
 `BenchmarkDotNet/results/` below that directory. Runner JSON verifies resource use;
 BenchmarkDotNet workload samples establish that the benchmark actually ran.
 
 Live previews received during an active tween snap to the newest layout. Other
-interrupted transitions can still jump from the previous target. The camera keeps
-the square layout's aspect ratio, leaving margins in wide windows. When retained
-nodes reverse ancestor relationships, the prepared draw order follows the target
-hierarchy.
+interrupted transitions can still jump from the previous target. When retained nodes
+reverse ancestor relationships, the prepared draw order follows the target hierarchy.

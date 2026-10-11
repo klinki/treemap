@@ -34,11 +34,13 @@ public static class SquarifyLayout
             return LayoutResult.Empty;
         }
 
+        int effectiveMax = EffectiveMaxDepth(options);
         List<LayoutCell> cells = new(capacity: 512);
 
         // One reusable scratch buffer per depth level. Depth is bounded by
-        // MaxDepth, so this is a fixed small allocation instead of per-node churn.
-        Entry[][] buffers = new Entry[options.MaxDepth + 2][];
+        // the effective (temporarily extended) max, capped at 64, so this is
+        // a fixed small allocation instead of per-node churn.
+        Entry[][] buffers = new Entry[effectiveMax + 2][];
         for (int i = 0; i < buffers.Length; i++)
         {
             buffers[i] = Array.Empty<Entry>();
@@ -51,8 +53,9 @@ public static class SquarifyLayout
         {
             RectF header = RectF.Empty;
             RectF content = bounds;
+            bool rootExpanded = root.Id == options.TemporaryExpandedNodeId;
             if (WantsHeader(hasChildren: root.Children.Count > 0, root.Kind, options)
-                && IsExpanded(root, depth: 0, bounds, options))
+                && IsExpanded(root, depth: 0, bounds, options, rootExpanded))
             {
                 float strip = options.HeaderHeight;
                 RectF remainder = new(bounds.X, bounds.Y + strip, bounds.Width, bounds.Height - strip);
@@ -84,17 +87,65 @@ public static class SquarifyLayout
                 PhysicalSize = root.PhysicalSize,
             });
 
-            if (root.Children.Count > 0 && IsExpanded(root, depth: 0, bounds, options) && !content.IsEmpty)
+            if (root.Children.Count > 0 && IsExpanded(root, depth: 0, bounds, options, rootExpanded) && !content.IsEmpty)
             {
                 buffers[1] = Fill(buffers[1], root.Children, options, out int rootChildCount);
                 Normalize(buffers[1], rootChildCount, content.Area);
                 Squarify(
                     buffers[1], rootChildCount, content, depth: 1, parentIndex: rootCell,
-                    options, cells, buffers, totalArea);
+                    options, cells, buffers, totalArea, rootExpanded);
             }
         }
 
         return LayoutResult.Build(cells, rootCell);
+    }
+
+    /// <summary>
+    /// Deepest depth the layout may reach: the normal budget, extended for the
+    /// temporary branch only. Both branches are hard-capped at 64 so scratch
+    /// buffers stay fixed-size; larger <see cref="LayoutOptions.MaxDepth"/> or
+    /// <see cref="LayoutOptions.TemporaryExtraDepth"/> values saturate at 64
+    /// rather than allocating unbounded buffers or recursing past them.
+    /// </summary>
+    internal static int EffectiveMaxDepth(LayoutOptions options)
+    {
+        if (options.TemporaryExpandedNodeId < 0 || options.TemporaryExtraDepth <= 0)
+        {
+            return Math.Min(64, options.MaxDepth);
+        }
+
+        return CappedWithExtra(options.MaxDepth, options.TemporaryExtraDepth);
+    }
+
+    private static int LimitFor(LayoutOptions options, bool inExpandedBranch)
+    {
+        if (inExpandedBranch && options.TemporaryExpandedNodeId >= 0 && options.TemporaryExtraDepth > 0)
+        {
+            return CappedWithExtra(options.MaxDepth, options.TemporaryExtraDepth);
+        }
+
+        return Math.Min(64, options.MaxDepth);
+    }
+
+    /// <summary>
+    /// Base depth plus extra levels, saturated at 64 without int overflow.
+    /// A base already at or above 64 returns 64 directly, so huge option values
+    /// (including <see cref="int.MaxValue"/>) never overflow the addition.
+    /// </summary>
+    private static int CappedWithExtra(int baseDepth, int extraDepth)
+    {
+        if (extraDepth <= 0)
+        {
+            return Math.Min(64, baseDepth);
+        }
+
+        if (baseDepth >= 64)
+        {
+            return 64;
+        }
+
+        long sum = (long)baseDepth + extraDepth;
+        return sum >= 64 ? 64 : (int)sum;
     }
 
     /// <summary>
@@ -134,10 +185,12 @@ public static class SquarifyLayout
     /// True when a node at <paramref name="depth"/> in <paramref name="rect"/> will
     /// actually show children: depth budget remains, a visible child exists, and
     /// the rect leaves usable child space after any header strip and padding.
+    /// The temporary branch uses its extended limit; every other branch keeps
+    /// the normal <see cref="LayoutOptions.MaxDepth"/>.
     /// </summary>
-    private static bool IsExpanded(TreemapNode node, int depth, in RectF rect, LayoutOptions options)
+    private static bool IsExpanded(TreemapNode node, int depth, in RectF rect, LayoutOptions options, bool inExpandedBranch = false)
     {
-        if (node.Children.Count == 0 || depth >= options.MaxDepth)
+        if (node.Children.Count == 0 || depth >= LimitFor(options, inExpandedBranch))
         {
             return false;
         }
@@ -200,7 +253,8 @@ public static class SquarifyLayout
         LayoutOptions options,
         List<LayoutCell> cells,
         Entry[][] buffers,
-        float totalArea)
+        float totalArea,
+        bool parentInExpandedBranch = false)
     {
         RectF remaining = rect;
         int i = 0;
@@ -259,7 +313,9 @@ public static class SquarifyLayout
                     height = MathF.Min(height, remaining.Bottom - y);
 
                     RectF cell = new(remaining.X, y, columnWidth, height);
-                    Emit(entries[k].Node, cell, depth, parentIndex, options, cells, buffers, totalArea);
+                    bool inExpanded = parentInExpandedBranch
+                        || entries[k].Node.Id == options.TemporaryExpandedNodeId;
+                    Emit(entries[k].Node, cell, depth, parentIndex, options, cells, buffers, totalArea, inExpanded);
 
                     y += height;
                     if (y >= remaining.Bottom - 1e-6f)
@@ -283,7 +339,9 @@ public static class SquarifyLayout
                     width = MathF.Min(width, remaining.Right - x);
 
                     RectF cell = new(x, remaining.Y, width, rowHeight);
-                    Emit(entries[k].Node, cell, depth, parentIndex, options, cells, buffers, totalArea);
+                    bool inExpandedRow = parentInExpandedBranch
+                        || entries[k].Node.Id == options.TemporaryExpandedNodeId;
+                    Emit(entries[k].Node, cell, depth, parentIndex, options, cells, buffers, totalArea, inExpandedRow);
 
                     x += width;
                     if (x >= remaining.Right - 1e-6f)
@@ -307,7 +365,8 @@ public static class SquarifyLayout
         LayoutOptions options,
         List<LayoutCell> cells,
         Entry[][] buffers,
-        float totalArea)
+        float totalArea,
+        bool inExpandedBranch = false)
     {
         if (!IsRenderable(rect, options))
         {
@@ -316,6 +375,7 @@ public static class SquarifyLayout
         }
 
         bool hasChildren = node.Children.Count > 0;
+        int limit = LimitFor(options, inExpandedBranch);
 
         int AddCollapsed()
         {
@@ -339,7 +399,8 @@ public static class SquarifyLayout
 
         // Collapsed when the depth budget is spent or there is nothing visible to
         // expand into: no header, no recursion, centred label.
-        if (!hasChildren || depth >= options.MaxDepth || !HasExpandableChildren(node, options))
+        // The temporary branch uses its extended limit; other branches keep MaxDepth.
+        if (!hasChildren || depth >= limit || !HasExpandableChildren(node, options))
         {
             return AddCollapsed();
         }
@@ -406,7 +467,7 @@ public static class SquarifyLayout
         Normalize(buffer, childCount, inner.Area);
 
         Squarify(
-            buffer, childCount, inner, nextDepth, selfIndex, options, cells, buffers, totalArea);
+            buffer, childCount, inner, nextDepth, selfIndex, options, cells, buffers, totalArea, inExpandedBranch);
 
         return selfIndex;
     }

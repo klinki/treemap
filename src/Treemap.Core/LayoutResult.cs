@@ -12,6 +12,8 @@ public sealed class LayoutOptions
     /// <summary>
     /// Hard recursion guard. Prevents stack exhaustion on pathological trees;
     /// also bounds work when a scan is still populating the model.
+    /// The layout hard-caps effective depth at 64 for every branch (see
+    /// scratch-buffer bound), so larger values saturate rather than recursing deeper.
     /// </summary>
     public int MaxDepth { get; init; } = 48;
 
@@ -36,6 +38,15 @@ public sealed class LayoutOptions
     /// <summary>Hides the unaccounted-space block from layout when false. The snapshot is untouched.</summary>
     public bool ShowUnknownSpace { get; init; } = true;
 
+    /// <summary>
+    /// Node id that shows extra descendant levels in its own branch only.
+    /// -1 disables the override; the normal <see cref="MaxDepth"/> applies everywhere.
+    /// </summary>
+    public int TemporaryExpandedNodeId { get; init; } = -1;
+
+    /// <summary>Extra depth levels granted to the temporary branch. 0 disables.</summary>
+    public int TemporaryExtraDepth { get; init; } = 0;
+
     public static LayoutOptions Default { get; } = new();
 
     /// <summary>Copies these options with selected overrides.</summary>
@@ -46,7 +57,9 @@ public sealed class LayoutOptions
         bool? showHeaders = null,
         float? headerHeight = null,
         bool? showFreeSpace = null,
-        bool? showUnknownSpace = null)
+        bool? showUnknownSpace = null,
+        int? temporaryExpandedNodeId = null,
+        int? temporaryExtraDepth = null)
         => new()
         {
             MinCellSize = minCellSize ?? MinCellSize,
@@ -56,6 +69,8 @@ public sealed class LayoutOptions
             HeaderHeight = headerHeight ?? HeaderHeight,
             ShowFreeSpace = showFreeSpace ?? ShowFreeSpace,
             ShowUnknownSpace = showUnknownSpace ?? ShowUnknownSpace,
+            TemporaryExpandedNodeId = temporaryExpandedNodeId ?? TemporaryExpandedNodeId,
+            TemporaryExtraDepth = temporaryExtraDepth ?? TemporaryExtraDepth,
         };
 
     /// <summary>
