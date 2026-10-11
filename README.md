@@ -152,7 +152,10 @@ tooltip shows the absolute path and logical or allocated size from the snapshot.
   parent, and Home or middle-click returns home. The wheel zooms around the cursor;
   dragging pans.
 - More detail and Less detail change visible descendant depth from 1 to 64 without
-  rescanning or changing zoom. The desktop starts at depth 4.
+  rescanning or changing zoom. The desktop starts at level 1, showing only the
+  immediate folders and files; level 2 shows their children, and so on. Each More
+  step reveals exactly one further generation, and Less reverses it, bounded at
+  level 1.
 - Free space and Unaccounted space independently show green and gray blocks.
   Both start visible. Toggling them reflows the map while preserving scan data and
   totals.

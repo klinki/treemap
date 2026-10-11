@@ -101,6 +101,63 @@ public class NavigationToolbarTests
     });
 
     [Fact]
+    public void FreshDefaultShowsImmediateChildrenAndEachStepMovesOneGeneration() => StaRunner.Run(() =>
+    {
+        // Fresh desktop/shell default: no depth override here.
+        using ScanShell shell = CreateShell(DeepTree());
+        PumpSettled(shell);
+
+        // Level 1: immediate folder and file visible, grandchildren hidden.
+        Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+        Assert.False(shell.LessDetailButton.Enabled);
+        Assert.True(shell.MoreDetailButton.Enabled);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 2 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 4 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 5 && c.Alpha > 0.01f);
+
+        // One More step: next folder+file generation appears, deeper stays hidden.
+        Click(shell.MoreDetailButton);
+        PumpSettled(shell);
+        Assert.Equal(TreemapController.MinDetailDepth + 1, shell.View.Controller.DetailDepth);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 5 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 7 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 8 && c.Alpha > 0.01f);
+
+        // Another More step: next generation appears, deepest stays hidden.
+        Click(shell.MoreDetailButton);
+        PumpSettled(shell);
+        Assert.Equal(TreemapController.MinDetailDepth + 2, shell.View.Controller.DetailDepth);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 7 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 8 && c.Alpha > 0.01f);
+
+        // Less restores exactly one generation.
+        Click(shell.LessDetailButton);
+        PumpSettled(shell);
+        Assert.Equal(TreemapController.MinDetailDepth + 1, shell.View.Controller.DetailDepth);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 5 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 7 && c.Alpha > 0.01f);
+
+        // Less cannot go below level 1.
+        while (shell.LessDetailButton.Enabled)
+        {
+            Click(shell.LessDetailButton);
+        }
+
+        PumpSettled(shell);
+        Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+        Assert.False(shell.LessDetailButton.Enabled);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 2 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 4 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+    });
+
+    [Fact]
     public void SpaceBoxesReflowWithoutRescanning() => StaRunner.Run(() =>
     {
         using ScanShell shell = CreateShell(Tree());
@@ -176,10 +233,36 @@ public class NavigationToolbarTests
 
         shell.StartScan(@"C:\");
         StaRunner.PumpUntil(() => !shell.IsScanning);
-        StaRunner.PumpUntil(() => shell.View.Controller.CurrentFrame.Any(c => c.NodeId == 3));
+        // The fresh default shows only immediate children (level 1), so wait for
+        // the immediate file rather than the depth-2 leaf the old default showed.
+        StaRunner.PumpUntil(() => shell.View.Controller.CurrentFrame.Any(c => c.NodeId == 4));
 
         return shell;
     }
+
+    /// <summary>
+    /// Tiny nested tree for the fresh-default regression: root 1, immediate folder 2
+    /// and file 4 (level 1), file 3 and subfolder 5 (level 2), file 6 and folder 7
+    /// (level 3), file 8 (level 4). Sizes keep every generation large enough to
+    /// survive culling once its level is shown.
+    /// </summary>
+    private static TreemapNode DeepTree()
+        => TreemapNode.Create(1, "C:", NodeKind.Drive, 0, 0, null, 0,
+        [
+            TreemapNode.Create(2, "sub", NodeKind.Folder, 0, 0, null, 0,
+            [
+                TreemapNode.Create(3, "a.txt", NodeKind.File, 1000, 1000, null, 0),
+                TreemapNode.Create(5, "nested", NodeKind.Folder, 0, 0, null, 0,
+                [
+                    TreemapNode.Create(6, "b.txt", NodeKind.File, 1000, 1000, null, 0),
+                    TreemapNode.Create(7, "deep", NodeKind.Folder, 0, 0, null, 0,
+                    [
+                        TreemapNode.Create(8, "c.txt", NodeKind.File, 1000, 1000, null, 0),
+                    ]),
+                ]),
+            ]),
+            TreemapNode.Create(4, "other.txt", NodeKind.File, 3000, 3000, null, 0),
+        ]);
 
     private static IEnumerable<Control> Descendants(Control parent)
     {

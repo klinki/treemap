@@ -303,6 +303,9 @@ public class FilterRowTests
 
         shell.StartScan(@"C:\");
         StaRunner.PumpUntil(() => !shell.IsScanning);
+        // Filter assertions need depth-2 leaves visible.
+        shell.View.Controller.SetLayoutOptions(shell.View.Controller.Options.With(maxDepth: 2));
+        shell.View.Controller.Relayout(animate: false);
         StaRunner.PumpUntil(() => shell.View.Controller.CurrentFrame.Any(c => c.NodeId == 3));
 
         return shell;

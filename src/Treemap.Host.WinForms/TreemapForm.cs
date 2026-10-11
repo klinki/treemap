@@ -105,9 +105,9 @@ public sealed class TreemapForm : Control
             MinCellSize = 2f,
             InnerPadding = 1.5f,
 
-            // Reference style: readable top-level layers with folder headers, and
-            // the synthetic space blocks shown until the user hides them.
-            MaxDepth = 4,
+            // Start with immediate children; each detail step adds one generation.
+            // Synthetic space blocks shown until the user hides them.
+            MaxDepth = TreemapController.MinDetailDepth,
             ShowHeaders = true,
             ShowFreeSpace = true,
             ShowUnknownSpace = true,

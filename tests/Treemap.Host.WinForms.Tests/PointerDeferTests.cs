@@ -329,6 +329,11 @@ public class PointerDeferTests
         using TreemapForm form = CreateForm(Tree());
         PumpSettled(form);
 
+        // This fixture needs the depth-2 leaf visible for the leaf click.
+        form.Controller.SetLayoutOptions(form.Controller.Options.With(maxDepth: 2));
+        form.Controller.Relayout(animate: false);
+        PumpSettled(form);
+
         // Leaf press: latches the file but grants no temporary expansion.
         Point at = FormGeometry.CellCenter(form, 3);
         MouseDown(form, at, clicks: 1);
