@@ -33,7 +33,7 @@ param(
     # artifacts/ is git-ignored; the parent directory is created if missing.
     [string]$LogPath = (Join-Path $PSScriptRoot '../artifacts/verification/bounded-run.log'),
     [ValidateRange(1, 600)][int]$TimeoutSeconds = 120,
-    [ValidateRange(128, 1024)][int]$ProcessMemoryMiB = 512,
+    [ValidateRange(128, 2048)][int]$ProcessMemoryMiB = 512,
     [ValidateRange(128, 2048)][int]$JobMemoryMiB = 1024
 )
 
