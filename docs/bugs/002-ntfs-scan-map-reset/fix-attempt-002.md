@@ -2,8 +2,8 @@
 
 ## Attempt status
 
-Local verification passed. Awaiting user confirmation after attempt 001 failed
-the visible C: reproduction.
+User confirmed the reset and crash are gone on 2026-10-11. Local verification
+passed after attempt 001 failed the visible C: reproduction.
 
 ## Goal
 
@@ -107,3 +107,10 @@ The local reset-and-memory-failure reproduction now passes with an explicitly
 partial map. Final checks passed; user confirmation remains pending. The memory
 allowance is a conservative estimate and can stop before the entry cap.
 External hard limits still protect against allocations outside that estimate.
+
+## User confirmation
+
+On 2026-10-11, the user retested the updated window and confirmed: "Yes, the reset
+and crash are gone". Attempt 002 resolves the reported bug. Earlier references to
+pending confirmation describe the state before this retest. Complete C: inventory
+and the NTFS record rejection remain separate limitations.

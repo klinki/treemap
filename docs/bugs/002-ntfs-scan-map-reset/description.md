@@ -2,7 +2,7 @@
 
 ## Status
 
-Awaiting user confirmation after attempt 002.
+Fixed after user confirmation of attempt 002 on 2026-10-11.
 
 ## Reported symptoms
 
@@ -48,3 +48,10 @@ Discovered tiles remained visible, the final map held 76,715 scanned entries, an
 the status named the memory limit. Peak process memory was 151.90 MiB. The scan
 remains incomplete, and C: still uses portable fallback after an NTFS record
 rejection. User confirmation of the reset/crash repair is pending.
+
+## User confirmation
+
+On 2026-10-11, the user retested the updated window and confirmed: "Yes, the reset
+and crash are gone". The reported bug is fixed. The scan still returns an explicit
+partial result at its memory budget, and the NTFS record rejection still causes
+portable fallback. The pending confirmation in the earlier update is resolved.

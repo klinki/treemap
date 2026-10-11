@@ -2,7 +2,7 @@
 
 ## Current state
 
-`awaiting-user-confirmation`.
+`fixed`.
 
 ## Active attempt
 
@@ -14,7 +14,7 @@
 
 ## Confirmation date
 
-Pending user retest.
+2026-10-11.
 
 ## Resolution summary
 
@@ -27,6 +27,10 @@ and an explicit incomplete result. Its visible C: retest preserved 76,715 discov
 entries at 151.90 MiB peak process memory, with no scan fault or guard termination.
 The scan is partial, and the immediate NTFS record rejection remains unresolved.
 
+The user confirmed on 2026-10-11 that the reset and crash are gone in the updated
+window. This closes the reported map-reset and process-exit bug. Complete C:
+inventory and the NTFS record rejection remain separate limitations.
+
 ## Attempt history
 
 - Attempt 001 planned after the C: reproduction narrowed the reset to scan
@@ -36,6 +40,7 @@ The scan is partial, and the immediate NTFS record rejection remains unresolved.
   [Attempt 002](fix-attempt-002.md) will bound discovery before construction fails.
 - Attempt 002 passed the visible C: reproduction and affected automated checks.
   Awaiting user confirmation; the bug remains open.
+- Attempt 002 confirmed by the user on 2026-10-11: "Yes, the reset and crash are gone".
 
 ## State change log
 
@@ -54,7 +59,11 @@ The scan is partial, and the immediate NTFS record rejection remains unresolved.
   partial result under unchanged caps. Core 170, scanner 283, and desktop 81 tests
   passed; six scanner checks were skipped by platform/environment.
 - 2026-10-11: Awaiting the user's retest before marking the reported bug fixed.
+- 2026-10-11: User confirmed that the reset and crash are gone. Marked fixed;
+  memory-limited partial scans and the NTFS fallback remain documented limitations.
 
 ## Notes
 
 Passing local verification will leave this bug awaiting user confirmation.
+
+User confirmation has now been received for the reported reset and crash.
