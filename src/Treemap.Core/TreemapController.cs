@@ -115,7 +115,11 @@ public sealed class TreemapController
 
     public bool CanIncreaseDetail => _options.MaxDepth < MaxDetailDepth;
 
-    public bool CanDecreaseDetail => _options.MaxDepth > MinDetailDepth;
+    /// <summary>
+    /// Less stays enabled while a temporary branch expansion is active, even at
+    /// the minimum depth, so the toolbar can always return the map to minimal.
+    /// </summary>
+    public bool CanDecreaseDetail => _options.MaxDepth > MinDetailDepth || _temporaryExpandedNodeId >= 0;
 
     /// <summary>Whether the free-space block takes part in layout. The snapshot is untouched.</summary>
     public bool ShowFreeSpace => _options.ShowFreeSpace;
@@ -305,7 +309,10 @@ public sealed class TreemapController
 
     /// <summary>
     /// Selects <paramref name="nodeId"/> and grants its branch two extra levels.
-    /// Files and blank (-1) clear the prior expansion. Returns whether the
+    /// Files and blank (-1) clear the prior expansion. The displayed root never
+    /// takes the expansion: expanding it would deepen every branch while the
+    /// toolbar still reports basic detail, so a root click only selects it and
+    /// clears any prior branch expansion. Returns whether the
     /// expansion changed, in which case the caller relayouts.
     /// </summary>
     public bool ExpandNodeTemporarily(int nodeId)
@@ -315,7 +322,8 @@ public sealed class TreemapController
         bool isFolder = requested >= 0
             && display.TryGetNode(requested, out TreemapNode? node)
             && node.Children.Count > 0;
-        int next = isFolder ? requested : -1;
+        bool isDisplayRoot = requested >= 0 && requested == _focusRootNodeId;
+        int next = isFolder && !isDisplayRoot ? requested : -1;
 
         if (requested != _selectedNodeId)
         {
@@ -641,30 +649,61 @@ public sealed class TreemapController
 
     /// <summary>
     /// Shows one more descendant level without touching camera zoom or rescanning.
+    /// Clears any temporary branch expansion, so global detail never stacks on
+    /// top of a focused branch. Returns true when the depth or the expansion
+    /// changed, in which case the caller relayouts.
     /// </summary>
     public bool IncreaseDetail()
     {
-        if (!CanIncreaseDetail)
+        bool cleared = _temporaryExpandedNodeId >= 0;
+        if (cleared)
         {
-            return false;
+            _temporaryExpandedNodeId = -1;
         }
 
-        _options = _options.With(maxDepth: _options.MaxDepth + 1);
-        Raise(ChangeKind.Layout);
-        return true;
+        bool deepened = false;
+        if (CanIncreaseDetail)
+        {
+            _options = _options.With(maxDepth: _options.MaxDepth + 1);
+            deepened = true;
+        }
+
+        if (cleared || deepened)
+        {
+            Raise(ChangeKind.Layout);
+            return true;
+        }
+
+        return false;
     }
 
-    /// <summary>Shows one fewer descendant level without touching camera zoom.</summary>
+    /// <summary>
+    /// Shows one fewer descendant level without touching camera zoom.
+    /// Clears any temporary branch expansion first, so Less at the minimum
+    /// depth still returns an expanded map to minimal instead of doing nothing.
+    /// </summary>
     public bool DecreaseDetail()
     {
-        if (!CanDecreaseDetail)
+        bool cleared = _temporaryExpandedNodeId >= 0;
+        if (cleared)
         {
-            return false;
+            _temporaryExpandedNodeId = -1;
         }
 
-        _options = _options.With(maxDepth: _options.MaxDepth - 1);
-        Raise(ChangeKind.Layout);
-        return true;
+        bool shallowed = false;
+        if (_options.MaxDepth > MinDetailDepth)
+        {
+            _options = _options.With(maxDepth: _options.MaxDepth - 1);
+            shallowed = true;
+        }
+
+        if (cleared || shallowed)
+        {
+            Raise(ChangeKind.Layout);
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>Replaces the layout options. The caller relayouts afterwards.</summary>

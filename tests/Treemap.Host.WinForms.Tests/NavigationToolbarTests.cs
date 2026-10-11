@@ -158,6 +158,216 @@ public class NavigationToolbarTests
     });
 
     [Fact]
+    public void RootClickKeepsFreshMapAtImmediateChildren() => StaRunner.Run(() =>
+    {
+        using ScanShell shell = CreateShell(DeepTree());
+        PumpSettled(shell);
+
+        int rootId = shell.View.Controller.FocusRootNodeId;
+
+        // A single click on the displayed root must not deepen every branch
+        // while the toolbar still reports basic detail 1.
+        Assert.False(shell.View.Controller.ExpandNodeTemporarily(rootId));
+        Assert.Equal(-1, shell.View.Controller.TemporaryExpandedNodeId);
+        shell.View.Controller.Relayout(animate: false);
+        PumpSettled(shell);
+
+        Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 2 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 4 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 5 && c.Alpha > 0.01f);
+    });
+
+    [Fact]
+    public void LessButtonAtMinimumClearsTemporaryExpansion() => StaRunner.Run(() =>
+    {
+        using ScanShell shell = CreateShell(DeepTree());
+        PumpSettled(shell);
+
+        Assert.True(shell.View.Controller.ExpandNodeTemporarily(2));
+        shell.View.Controller.Relayout(animate: false);
+        PumpSettled(shell);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+
+        // Less stays available while the branch expansion is active, even at
+        // minimum depth, and returns the map to minimal in one step.
+        Assert.True(shell.LessDetailButton.Enabled);
+        Click(shell.LessDetailButton);
+        PumpSettled(shell);
+
+        Assert.Equal(-1, shell.View.Controller.TemporaryExpandedNodeId);
+        Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+        Assert.False(shell.LessDetailButton.Enabled);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 2 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+    });
+
+    [Fact]
+    public void StartingANewScanResetsTemporaryExpansion() => StaRunner.Run(() =>
+    {
+        using ScanShell shell = CreateShell(DeepTree());
+        PumpSettled(shell);
+
+        Assert.True(shell.View.Controller.ExpandNodeTemporarily(2));
+        shell.View.Controller.Relayout(animate: false);
+        PumpSettled(shell);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+
+        shell.StartScan(@"C:\");
+        StaRunner.PumpUntil(() => !shell.IsScanning);
+        PumpSettled(shell);
+
+        Assert.Equal(-1, shell.View.Controller.TemporaryExpandedNodeId);
+        Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+    });
+
+    [Fact]
+    public void FreshScanWithDeepeningPreviewsKeepsMinimalFrameInStepWithToolbar() => StaRunner.Run(() =>
+    {
+        // Simulates a live scan whose previews deepen the published tree while the
+        // user never clicks: shallow basis, then richer same-source previews, then
+        // the final tree. Every publish carries the scan's RootPath explicitly, so
+        // the controller takes the real new-source then same-source path.
+        TreemapNode shallow = TreemapNode.Create(1, "C:", NodeKind.Drive, 0, 0, null, 0,
+        [
+            TreemapNode.Create(2, "sub", NodeKind.Folder, 0, 0, null, 0),
+            TreemapNode.Create(4, "other.txt", NodeKind.File, 3000, 3000, null, 0),
+        ]);
+        TreemapNode mid = TreemapNode.Create(1, "C:", NodeKind.Drive, 0, 0, null, 0,
+        [
+            TreemapNode.Create(2, "sub", NodeKind.Folder, 0, 0, null, 0,
+            [
+                TreemapNode.Create(3, "a.txt", NodeKind.File, 1000, 1000, null, 0),
+                TreemapNode.Create(5, "nested", NodeKind.Folder, 0, 0, null, 0,
+                [
+                    TreemapNode.Create(6, "b.txt", NodeKind.File, 1000, 1000, null, 0),
+                ]),
+            ]),
+            TreemapNode.Create(4, "other.txt", NodeKind.File, 3000, 3000, null, 0),
+        ]);
+        TreemapNode full = DeepTree();
+
+        TaskCompletionSource allowMiddle = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource allowFinal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using ScanShell shell = new(
+            (rootPath, publisher, options, progress, token) => Task.Run(async () =>
+            {
+                publisher.Publish(shallow, rootPath);
+                await allowMiddle.Task.WaitAsync(token);
+                publisher.Publish(mid, rootPath);
+                await allowFinal.Task.WaitAsync(token);
+                publisher.Publish(full, rootPath);
+                return Result(rootPath, full);
+            }, token),
+            ScanOptions.Default with { Backend = ScanBackendPreference.Portable });
+
+        _ = shell.Handle;
+        shell.PerformLayout();
+        _ = shell.View.Handle;
+
+        foreach (Control descendant in Descendants(shell))
+        {
+            _ = descendant.Handle;
+        }
+
+        shell.StartScan(@"C:\");
+        AssertMinimalPreview(shallow);
+        allowMiddle.SetResult();
+        AssertMinimalPreview(mid);
+        allowFinal.SetResult();
+        StaRunner.PumpUntil(() => !shell.IsScanning);
+        PumpSettled(shell);
+
+        void AssertMinimalPreview(TreemapNode expected)
+        {
+            StaRunner.PumpUntil(() => shell.View.Controller.CurrentFrame.Any(
+                cell => cell.NodeId == 1 && cell.LogicalSize == expected.LogicalSize));
+            PumpSettled(shell);
+            Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+            Assert.Equal(-1, shell.View.Controller.TemporaryExpandedNodeId);
+            Assert.False(shell.LessDetailButton.Enabled);
+            Assert.DoesNotContain(shell.View.Controller.CurrentFrame,
+                cell => cell.Alpha > 0.01f && cell.Depth > TreemapController.MinDetailDepth);
+        }
+
+        // Toolbar reports basic detail 1 with no temporary branch.
+        Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+        Assert.Equal(-1, shell.View.Controller.TemporaryExpandedNodeId);
+        Assert.False(shell.LessDetailButton.Enabled);
+        Assert.True(shell.MoreDetailButton.Enabled);
+
+        // Effective frame agrees: immediate children visible, deeper generations
+        // hidden, and no visible cell exceeds the toolbar's depth budget.
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 2 && c.Alpha > 0.01f);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 4 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 5 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 6 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 7 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 8 && c.Alpha > 0.01f);
+
+        foreach (TweenedCell cell in shell.View.Controller.CurrentFrame)
+        {
+            if (cell.Alpha > 0.01f)
+            {
+                Assert.True(
+                    cell.Depth <= TreemapController.MinDetailDepth,
+                    $"visible node {cell.NodeId} at depth {cell.Depth} exceeds toolbar detail {TreemapController.MinDetailDepth}");
+            }
+        }
+    });
+
+    [Fact]
+    public void PendingClickFromBeforeScanCannotDeepenFreshSource() => StaRunner.Run(() =>
+    {
+        // A press latched on the old map must not expand the fresh one: the
+        // deferred timer fires by id only while the source still matches.
+        using ScanShell shell = new(
+            (rootPath, publisher, options, progress, token) =>
+            {
+                publisher.Publish(DeepTree(), rootPath);
+                return Task.FromResult(Result(rootPath, DeepTree()));
+            },
+            ScanOptions.Default with { Backend = ScanBackendPreference.Portable });
+
+        _ = shell.Handle;
+        shell.PerformLayout();
+        _ = shell.View.Handle;
+
+        foreach (Control descendant in Descendants(shell))
+        {
+            _ = descendant.Handle;
+        }
+
+        shell.StartScan(@"C:\old");
+        StaRunner.PumpUntil(() => !shell.IsScanning);
+        PumpSettled(shell);
+
+        Point at = FormGeometry.CellHeaderPoint(shell.View, 2);
+        MouseDown(shell.View, at);
+        MouseUp(shell.View, at);
+        Assert.True(shell.View.HasPendingSingleClick);
+
+        shell.StartScan(@"C:\new");
+        StaRunner.PumpUntil(() => !shell.IsScanning);
+        PumpSettled(shell);
+
+        // Resolve the deferred click deterministically instead of waiting out
+        // the real double-click interval; a source mismatch must drop it.
+        shell.View.FirePendingClickForTests();
+        PumpSettled(shell);
+
+        Assert.Equal(-1, shell.View.Controller.TemporaryExpandedNodeId);
+        Assert.Equal(-1, shell.View.Controller.SelectedNodeId);
+        Assert.Equal(TreemapController.MinDetailDepth, shell.View.Controller.DetailDepth);
+        Assert.False(shell.LessDetailButton.Enabled);
+        Assert.Contains(shell.View.Controller.CurrentFrame, c => c.NodeId == 2 && c.Alpha > 0.01f);
+        Assert.DoesNotContain(shell.View.Controller.CurrentFrame, c => c.NodeId == 3 && c.Alpha > 0.01f);
+    });
+
+    [Fact]
     public void SpaceBoxesReflowWithoutRescanning() => StaRunner.Run(() =>
     {
         using ScanShell shell = CreateShell(Tree());
@@ -211,6 +421,21 @@ public class NavigationToolbarTests
 
     private static void PumpSettled(ScanShell shell)
         => StaRunner.PumpUntil(() => !shell.View.Controller.IsAnimating);
+
+    private static void MouseDown(TreemapForm form, Point at)
+        => Invoke(form, "OnMouseDown", new MouseEventArgs(MouseButtons.Left, 1, at.X, at.Y, 0));
+
+    private static void MouseUp(TreemapForm form, Point at)
+        => Invoke(form, "OnMouseUp", new MouseEventArgs(MouseButtons.Left, 1, at.X, at.Y, 0));
+
+    private static void Invoke(TreemapForm form, string method, MouseEventArgs args)
+    {
+        MethodInfo? target = typeof(TreemapForm).GetMethod(
+            method, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(target);
+        target.Invoke(form, [args]);
+        Application.DoEvents();
+    }
 
     private static ScanShell CreateShell(TreemapNode root)
     {

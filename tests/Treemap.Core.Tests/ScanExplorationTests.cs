@@ -287,6 +287,116 @@ public class TemporaryExpansionTests
     }
 
     [Fact]
+    public void ClickingDisplayRootClearsInsteadOfExpandingEverywhere()
+    {
+        TreemapNode root = TreeBuilder.Drive(1, "C:",
+            TreeBuilder.Folder(2, "folderA",
+                TreeBuilder.Folder(20, "deepA",
+                    TreeBuilder.File(21, "a1.bin", 400))),
+            TreeBuilder.Folder(3, "folderB",
+                TreeBuilder.Folder(30, "deepB",
+                    TreeBuilder.File(31, "b1.bin", 400))));
+        SnapshotPublisher publisher = new(root);
+        publisher.Publish(root);
+        TreemapController controller = new(publisher, new LayoutOptions { MaxDepth = TreemapController.MinDetailDepth });
+        controller.SetViewport(new RectF(0, 0, 800, 600));
+        controller.Relayout(animate: false);
+
+        // Fresh basic detail shows only immediate children.
+        Assert.Equal(TreemapController.MinDetailDepth, controller.DetailDepth);
+        Assert.False(FrameHas(controller, 20));
+        Assert.False(FrameHas(controller, 30));
+
+        // A root click on the fresh map grants nothing and reports no change.
+        Assert.False(controller.ExpandNodeTemporarily(1));
+        Assert.Equal(-1, controller.TemporaryExpandedNodeId);
+        controller.Relayout(animate: false);
+        Assert.False(FrameHas(controller, 20));
+        Assert.False(FrameHas(controller, 30));
+
+        // A root click after a branch expansion clears back to minimal
+        // instead of deepening every branch while the toolbar says basic 1.
+        Assert.True(controller.ExpandNodeTemporarily(2));
+        controller.Relayout(animate: false);
+        Assert.True(FrameHas(controller, 21));
+
+        Assert.True(controller.ExpandNodeTemporarily(1));
+        Assert.Equal(1, controller.SelectedNodeId);
+        Assert.Equal(-1, controller.TemporaryExpandedNodeId);
+        controller.Relayout(animate: false);
+        Assert.False(FrameHas(controller, 20));
+        Assert.False(FrameHas(controller, 30));
+        Assert.Equal(TreemapController.MinDetailDepth, controller.DetailDepth);
+    }
+
+    [Fact]
+    public void DetailButtonsClearTemporaryExpansion()
+    {
+        TreemapNode root = Tree();
+        SnapshotPublisher publisher = new(root);
+        publisher.Publish(root);
+        TreemapController controller = new(publisher, new LayoutOptions { MaxDepth = TreemapController.MinDetailDepth });
+        controller.SetViewport(new RectF(0, 0, 800, 600));
+        controller.Relayout(animate: false);
+
+        controller.ExpandNodeTemporarily(2);
+        controller.Relayout(animate: false);
+        Assert.True(FrameHas(controller, 21));
+
+        // Less at the minimum still returns to minimal by clearing the branch.
+        Assert.True(controller.CanDecreaseDetail);
+        Assert.True(controller.DecreaseDetail());
+        Assert.Equal(-1, controller.TemporaryExpandedNodeId);
+        Assert.Equal(TreemapController.MinDetailDepth, controller.DetailDepth);
+        controller.Relayout(animate: false);
+        Assert.False(FrameHas(controller, 21));
+
+        // More clears the branch while adding its single global generation.
+        controller.ExpandNodeTemporarily(2);
+        controller.Relayout(animate: false);
+        Assert.True(controller.IncreaseDetail());
+        Assert.Equal(-1, controller.TemporaryExpandedNodeId);
+        Assert.Equal(TreemapController.MinDetailDepth + 1, controller.DetailDepth);
+    }
+
+    [Fact]
+    public void DefaultDetailShowsOnlyImmediateChildrenBeforeAndAfterPublish()
+    {
+        TreemapNode root = TreeBuilder.Drive(1, "C:",
+            TreeBuilder.Folder(2, "folderA",
+                TreeBuilder.Folder(20, "deepA",
+                    TreeBuilder.File(21, "a1.bin", 400))),
+            TreeBuilder.File(4, "top.bin", 400));
+        SnapshotPublisher publisher = new(root);
+        publisher.Publish(root);
+        TreemapController controller = new(
+            publisher, new LayoutOptions { MaxDepth = TreemapController.MinDetailDepth });
+        controller.SetViewport(new RectF(0, 0, 800, 600));
+        controller.Relayout(animate: false);
+
+        Assert.Equal(TreemapController.MinDetailDepth, controller.DetailDepth);
+        Assert.Equal(-1, controller.TemporaryExpandedNodeId);
+        Assert.True(FrameHas(controller, 2));
+        Assert.True(FrameHas(controller, 4));
+        Assert.False(FrameHas(controller, 20));
+        Assert.False(FrameHas(controller, 21));
+
+        publisher.Publish(TreeBuilder.Drive(1, "C:",
+            TreeBuilder.Folder(2, "folderA",
+                TreeBuilder.Folder(20, "deepA",
+                    TreeBuilder.File(21, "a1.bin", 400))),
+            TreeBuilder.File(4, "top.bin", 400)));
+        controller.Relayout(animate: false);
+
+        Assert.Equal(TreemapController.MinDetailDepth, controller.DetailDepth);
+        Assert.Equal(-1, controller.TemporaryExpandedNodeId);
+        Assert.True(FrameHas(controller, 2));
+        Assert.True(FrameHas(controller, 4));
+        Assert.False(FrameHas(controller, 20));
+        Assert.False(FrameHas(controller, 21));
+    }
+
+    [Fact]
     public void ClickSelectsExpandsAndKeepsFocusCameraHistory()
     {
         TreemapController controller = Controller();

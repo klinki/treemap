@@ -721,6 +721,18 @@ internal sealed class ScanShell : Form
 
         try
         {
+            // A new scan starts from minimal detail: drop any temporary branch
+            // expansion so the fresh map never inherits deep cells while the
+            // toolbar still reports basic detail. Same-source previews keep
+            // whatever is active after this point; only the scan boundary resets.
+            // Inside the try so a fault here still reaches the cleanup below
+            // instead of escaping the async runner with the controls stuck busy.
+            if (_view.Controller.TemporaryExpandedNodeId >= 0
+                && _view.Controller.ExpandNodeTemporarily(-1))
+            {
+                _view.Controller.Relayout(animate: false);
+            }
+
             // Constructed on the UI thread, so Progress<T> captures the WinForms
             // synchronization context and delivers each report as a posted callback.
             IProgress<ScanProgress> progress = new Progress<ScanProgress>(tick => OnScanProgress(generation, tick));
