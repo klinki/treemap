@@ -11,6 +11,14 @@ internal interface IMftRecordSource : IDisposable
     MftGeometry Geometry { get; }
 
     /// <summary>
+    /// How this source's records are represented: on-disk bytes still carrying the update
+    /// sequence tag in every unit's tail (<see cref="MftRecordRepresentation.Raw"/>), or
+    /// kernel-decoded bytes whose tails the filesystem already restored
+    /// (<see cref="MftRecordRepresentation.FixupApplied"/>).
+    /// </summary>
+    MftRecordRepresentation Representation { get; }
+
+    /// <summary>
     /// Finds the record in use with the highest ordinal at or below
     /// <paramref name="ordinal"/>, copies it into <paramref name="destination"/> from
     /// <see cref="MftGeometry.OutputHeaderLength"/>, and returns its ordinal and length.
@@ -136,7 +144,7 @@ internal static class MftRecordStream
 
             ReadOnlySpan<byte> payload = buffer.AsSpan(MftGeometry.OutputHeaderLength, payloadLength);
 
-            if (!MftRecordParser.TryParse(actual, payload, record, out string? parseFailure))
+            if (!MftRecordParser.TryParse(actual, payload, record, out string? parseFailure, source.Representation))
             {
                 failureReason = parseFailure;
                 return false;

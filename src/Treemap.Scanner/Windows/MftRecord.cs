@@ -46,6 +46,34 @@ internal enum MftAttributeType : uint
     ReparsePoint = 0xC0,
 }
 
+/// <summary>
+/// How an MFT record's bytes are represented before parsing.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="Raw"/> is the record as stored on disk: the last two bytes of every
+/// 512-byte unit carry the update sequence tag, and the <c>USA</c> save area holds
+/// what each unit really ended with. The parser must check the tag and write the
+/// saved words back.
+/// </para>
+/// <para>
+/// <see cref="FixupApplied"/> is the record as <c>FSCTL_GET_NTFS_FILE_RECORD</c>
+/// returns it: the filesystem has already validated the tag while reading the
+/// sectors and restored the saved words over the tails, so the tails hold ordinary
+/// content that only coincidentally equals the tag. Checking the tails against the
+/// tag again rejects nearly every healthy record (the first record walked, every
+/// run), and writing the save area back a second time corrupts the restored tails.
+/// </para>
+/// </remarks>
+internal enum MftRecordRepresentation : byte
+{
+    /// <summary>On-disk bytes; tails carry the update sequence tag.</summary>
+    Raw = 0,
+
+    /// <summary>Kernel-decoded bytes; tails already hold the restored content.</summary>
+    FixupApplied = 1,
+}
+
 /// <summary>Everything one MFT record contributed. Reused for every record in a walk.</summary>
 internal sealed class MftRecordInfo
 {
@@ -191,8 +219,12 @@ internal static class MftRecordParser
     private const uint EndOfAttributes = 0xFFFF_FFFF;
     private const ulong ReferenceOrdinalMask = 0x0000_FFFF_FFFF_FFFFUL;
 
-    /// <summary>Parses one record, or returns the reason it cannot be trusted.</summary>
+    /// <summary>Parses one on-disk (<see cref="MftRecordRepresentation.Raw"/>) record, or returns the reason it cannot be trusted.</summary>
     public static bool TryParse(ulong ordinal, ReadOnlySpan<byte> record, MftRecordInfo info, out string? failure)
+        => TryParse(ordinal, record, info, out failure, MftRecordRepresentation.Raw);
+
+    /// <summary>Parses one record in the stated representation, or returns the reason it cannot be trusted.</summary>
+    public static bool TryParse(ulong ordinal, ReadOnlySpan<byte> record, MftRecordInfo info, out string? failure, MftRecordRepresentation representation)
     {
         info.Reset(ordinal);
         failure = null;
@@ -237,7 +269,7 @@ internal static class MftRecordParser
             Span<byte> copy = scratch.AsSpan(0, record.Length);
             record.CopyTo(copy);
 
-            if (!TryRepairUpdateSequence(copy, (int)bytesAllocated, firstAttribute, out string? repairFailure))
+            if (!TryPrepareUpdateSequence(copy, (int)bytesAllocated, firstAttribute, representation, out string? repairFailure))
             {
                 failure = $"MFT record {ordinal} {repairFailure}";
                 return false;
@@ -262,6 +294,33 @@ internal static class MftRecordParser
     }
 
     /// <summary>
+    /// Prepares the record's tails for reading: repairs them for <see cref="MftRecordRepresentation.Raw"/>,
+    /// or only validates the array shape for <see cref="MftRecordRepresentation.FixupApplied"/>
+    /// (whose tails the kernel already restored).
+    /// </summary>
+    internal static bool TryPrepareUpdateSequence(
+        Span<byte> record,
+        int bytesAllocated,
+        int firstAttribute,
+        MftRecordRepresentation representation,
+        out string? failure)
+        => representation == MftRecordRepresentation.FixupApplied
+            ? TryValidateUpdateSequenceArray(record, bytesAllocated, firstAttribute, out failure)
+            : TryRepairUpdateSequence(record, bytesAllocated, firstAttribute, out failure);
+
+    /// <summary>
+    /// Checks the update sequence array shape of a kernel-decoded record without touching
+    /// its tails. The tails hold restored content, not the tag, so comparing them to the
+    /// tag would reject healthy records and writing the save area back would corrupt them.
+    /// </summary>
+    internal static bool TryValidateUpdateSequenceArray(
+        Span<byte> record,
+        int bytesAllocated,
+        int firstAttribute,
+        out string? failure)
+        => TryReadUpdateSequenceHeader(record, bytesAllocated, firstAttribute, out _, out _, out failure);
+
+    /// <summary>
     /// Puts back the two bytes at the end of every 512-byte unit, and proves the record was
     /// written whole.
     /// </summary>
@@ -269,6 +328,8 @@ internal static class MftRecordParser
     /// The array holds a tag followed by what each unit really ended with. The live bytes at the
     /// end of each unit are what to check against the tag, and the saved words are what to write
     /// back; comparing the save area with itself would accept any torn record.
+    /// Only for <see cref="MftRecordRepresentation.Raw"/> bytes. Kernel-decoded records must
+    /// go through <see cref="TryValidateUpdateSequenceArray"/> instead.
     /// </remarks>
     internal static bool TryRepairUpdateSequence(
         Span<byte> record,
@@ -276,30 +337,8 @@ internal static class MftRecordParser
         int firstAttribute,
         out string? failure)
     {
-        if (record.Length % UpdateSequenceStride != 0 || bytesAllocated % UpdateSequenceStride != 0)
+        if (!TryReadUpdateSequenceHeader(record, bytesAllocated, firstAttribute, out int usaOffset, out int usaCount, out failure))
         {
-            failure = $"is not a whole number of {UpdateSequenceStride}-byte units.";
-            return false;
-        }
-
-        int usaOffset = BinaryPrimitives.ReadUInt16LittleEndian(record[UpdateSequenceOffsetField..]);
-        int usaCount = BinaryPrimitives.ReadUInt16LittleEndian(record[UpdateSequenceCountField..]);
-        int sectors = bytesAllocated / UpdateSequenceStride;
-
-        if (usaCount != sectors + 1)
-        {
-            failure = $"carries {usaCount} update sequence entries where its {bytesAllocated} allocated bytes need {sectors + 1}.";
-            return false;
-        }
-
-        // The array has to fit inside the first unit, ahead of the attributes: a tag array that
-        // overruns the header is describing a record that is not there.
-        if (usaOffset < MinimumRecordLength ||
-            (usaCount * 2) > UpdateSequenceStride ||
-            usaOffset + (usaCount * 2) > UpdateSequenceStride ||
-            usaOffset + (usaCount * 2) > firstAttribute)
-        {
-            failure = "has an update sequence array that does not fit inside its header.";
             return false;
         }
 
@@ -322,6 +361,53 @@ internal static class MftRecordParser
             int tail = (i * UpdateSequenceStride) - 2;
             ushort saved = BinaryPrimitives.ReadUInt16LittleEndian(record[(usaOffset + (i * 2))..]);
             BinaryPrimitives.WriteUInt16LittleEndian(record[tail..], saved);
+        }
+
+        failure = null;
+        return true;
+    }
+
+    /// <summary>
+    /// Checks the record length, the entry count and that the array fits inside the first
+    /// unit ahead of the attributes. Shared by both representations: a malformed array
+    /// rejects the record however its tails arrived.
+    /// </summary>
+    private static bool TryReadUpdateSequenceHeader(
+        Span<byte> record,
+        int bytesAllocated,
+        int firstAttribute,
+        out int usaOffset,
+        out int usaCount,
+        out string? failure)
+    {
+        usaOffset = 0;
+        usaCount = 0;
+
+        if (record.Length % UpdateSequenceStride != 0 || bytesAllocated % UpdateSequenceStride != 0)
+        {
+            failure = $"is not a whole number of {UpdateSequenceStride}-byte units.";
+            return false;
+        }
+
+        usaOffset = BinaryPrimitives.ReadUInt16LittleEndian(record[UpdateSequenceOffsetField..]);
+        usaCount = BinaryPrimitives.ReadUInt16LittleEndian(record[UpdateSequenceCountField..]);
+        int sectors = bytesAllocated / UpdateSequenceStride;
+
+        if (usaCount != sectors + 1)
+        {
+            failure = $"carries {usaCount} update sequence entries where its {bytesAllocated} allocated bytes need {sectors + 1}.";
+            return false;
+        }
+
+        // The array has to fit inside the first unit, ahead of the attributes: a tag array that
+        // overruns the header is describing a record that is not there.
+        if (usaOffset < MinimumRecordLength ||
+            (usaCount * 2) > UpdateSequenceStride ||
+            usaOffset + (usaCount * 2) > UpdateSequenceStride ||
+            usaOffset + (usaCount * 2) > firstAttribute)
+        {
+            failure = "has an update sequence array that does not fit inside its header.";
+            return false;
         }
 
         failure = null;

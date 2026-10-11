@@ -347,6 +347,42 @@ internal sealed class MftRecordBuilder
     }
 
     /// <summary>
+    /// Produces the record as <c>FSCTL_GET_NTFS_FILE_RECORD</c> returns it: the on-disk
+    /// bytes with the update sequence already applied, i.e. the saved words written back
+    /// over the unit tails. A healthy record in this form carries ordinary content in its
+    /// tails, not the tag, so parsing it as <see cref="MftRecordRepresentation.Raw"/>
+    /// reports it torn.
+    /// </summary>
+    public byte[] BuildFixupApplied()
+    {
+        byte[] raw = Build();
+        ApplyFixup(raw);
+        return raw;
+    }
+
+    /// <summary>
+    /// Simulates the kernel's fixup: copies each saved word over its unit tail, as the
+    /// filesystem does before handing the record to the caller.
+    /// </summary>
+    public static void ApplyFixup(byte[] record)
+    {
+        int usaOffset = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(UsaOffsetField));
+        int usaCount = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(UsaCountField));
+
+        for (int i = 1; i < usaCount; i++)
+        {
+            int tail = (i * MftRecordParser.UpdateSequenceStride) - 2;
+            if (tail + 2 > record.Length || usaOffset + (i * 2) + 2 > record.Length)
+            {
+                break;
+            }
+
+            ushort saved = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(usaOffset + (i * 2)));
+            BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(tail), saved);
+        }
+    }
+
+    /// <summary>
     /// The array holds a tag followed by what each 512-byte unit really ended with. The word
     /// that is really there is the one that goes into the save area; the tag then goes over
     /// it. That is the order NTFS writes them in, so a record this builder produces is
@@ -478,6 +514,13 @@ internal sealed class FixtureRecordSource : IMftRecordSource
     public FixtureRecordSource(MftGeometry geometry) => Geometry = geometry;
 
     public MftGeometry Geometry { get; }
+
+    /// <summary>
+    /// On-disk bytes by default: the builder writes the tag into every unit tail, so the
+    /// raw torn checks apply. Tests modelling kernel-decoded output set this to
+    /// <see cref="MftRecordRepresentation.FixupApplied"/>.
+    /// </summary>
+    public MftRecordRepresentation Representation { get; set; } = MftRecordRepresentation.Raw;
 
     public int Reads { get; private set; }
 

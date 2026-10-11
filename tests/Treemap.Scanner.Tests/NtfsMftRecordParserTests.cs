@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using Treemap.Scanning;
 using Treemap.Scanning.Windows;
 using Xunit;
 
@@ -137,6 +138,146 @@ public class NtfsMftRecordParserTests
         MftRecordInfo info = new();
         Assert.True(MftRecordParser.TryParse(AFile, record, info, out string? failure), failure);
         Assert.True(info.HasUnnamedData);
+    }
+
+    // ── Kernel-decoded (FSCTL_GET_NTFS_FILE_RECORD) representation ────────────────
+
+    /// <summary>
+    /// <c>FSCTL_GET_NTFS_FILE_RECORD</c> hands back the record after the filesystem has
+    /// restored the saved words over the unit tails. Those tails hold ordinary content,
+    /// not the tag, so the raw torn check rejects the healthy record while the
+    /// fixup-applied parse accepts it. This is the C:\ first-record failure: the walk's
+    /// very first record is healthy, yet raw parsing declines it as torn.
+    /// </summary>
+    [Fact]
+    public void AFixupAppliedRecordWithRestoredTailsParsesWithoutATornFailure()
+    {
+        byte[] record = new MftRecordBuilder()
+            .UpdateSequenceTag(0xABCD)
+            .SavedWord(0, 0x0000)
+            .SavedWord(1, 0x1234)
+            .AddStandardInformation(FileAttributes.Normal)
+            .AddFileName(VolumeRoot, "fixup-applied.bin")
+            .AddDataNonResident(dataSize: 4_096, allocatedSize: 8_192)
+            .BuildFixupApplied();
+
+        // Kernel-decoded tails carry the restored words, not the tag.
+        Assert.Equal(0x0000, BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(510)));
+        Assert.Equal(0x1234, BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(1022)));
+
+        MftRecordInfo info = new();
+        Assert.True(
+            MftRecordParser.TryParse(AFile, record, info, out string? failure, MftRecordRepresentation.FixupApplied),
+            failure);
+        Assert.Equal("fixup-applied.bin", Assert.Single(info.Names).Name);
+        Assert.True(info.HasUnnamedData);
+    }
+
+    [Fact]
+    public void ARestoredRecordParsedAsRawIsStillTorn()
+    {
+        byte[] record = new MftRecordBuilder()
+            .UpdateSequenceTag(0xABCD)
+            .SavedWord(0, 0x0000)
+            .SavedWord(1, 0x1234)
+            .AddStandardInformation(FileAttributes.Normal)
+            .AddFileName(VolumeRoot, "healthy.bin")
+            .BuildFixupApplied();
+
+        // The raw torn check is not weakened: restored tails are not the tag.
+        MftRecordInfo info = new();
+        Assert.False(MftRecordParser.TryParse(AFile, record, info, out string? failure));
+        Assert.Contains("torn", failure!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AFixupAppliedRecordLeavesItsRestoredTailsAlone()
+    {
+        byte[] record = new MftRecordBuilder()
+            .UpdateSequenceTag(0xABCD)
+            .SavedWord(0, 0x2222)
+            .SavedWord(1, 0x3333)
+            .AddStandardInformation(FileAttributes.Normal)
+            .AddFileName(VolumeRoot, "tails.bin")
+            .BuildFixupApplied();
+
+        MftRecordInfo info = new();
+        Assert.True(
+            MftRecordParser.TryParse(AFile, record, info, out string? failure, MftRecordRepresentation.FixupApplied),
+            failure);
+
+        // No second write-back of the save area: the restored content survives parsing.
+        Assert.Equal(0x2222, BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(510)));
+        Assert.Equal(0x3333, BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(1022)));
+    }
+
+    [Fact]
+    public void AFixupAppliedRecordWithABadUpdateSequenceCountIsRejected()
+    {
+        byte[] record = new MftRecordBuilder()
+            .AddStandardInformation(FileAttributes.Normal)
+            .AddFileName(VolumeRoot, "bad-count.bin")
+            .BuildFixupApplied();
+        BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(0x06), 2);
+
+        MftRecordInfo info = new();
+        Assert.False(MftRecordParser.TryParse(AFile, record, info, out string? failure, MftRecordRepresentation.FixupApplied));
+        Assert.Contains("update sequence entries", failure!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AFixupAppliedRecordWithAnOverrunningArrayIsRejected()
+    {
+        byte[] record = new MftRecordBuilder()
+            .AddStandardInformation(FileAttributes.Normal)
+            .AddFileName(VolumeRoot, "bad-array.bin")
+            .BuildFixupApplied();
+        BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(0x04), 0x200);
+
+        MftRecordInfo info = new();
+        Assert.False(MftRecordParser.TryParse(AFile, record, info, out string? failure, MftRecordRepresentation.FixupApplied));
+        Assert.Contains("update sequence array", failure!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AFixupAppliedWalkSourceParsesItsRestoredRecord()
+    {
+        MftGeometry geometry = new(4096, 1024, 4096);
+        FixtureRecordSource source = new(geometry)
+        {
+            Representation = MftRecordRepresentation.FixupApplied,
+        };
+        source.Add(42, new MftRecordBuilder()
+            .UpdateSequenceTag(0xABCD)
+            .SavedWord(0, 0x0000)
+            .SavedWord(1, 0x1234)
+            .AddStandardInformation(FileAttributes.Normal)
+            .AddFileName(VolumeRoot, "walked.bin")
+            .AddDataNonResident(dataSize: 4_096, allocatedSize: 4_096)
+            .BuildFixupApplied());
+
+        ScanCollector collector = new(ScanOptions.Default, progress: null);
+        CountingVisitor visitor = new();
+
+        // As Raw this same record would decline as torn on the first visit; as
+        // FixupApplied the walk reaches it.
+        Assert.True(
+            MftRecordStream.TryWalk(source, CancellationToken.None, collector, @"C:\", visitor, out string? failure),
+            failure);
+        Assert.Equal(1, visitor.Count);
+    }
+
+    private sealed class CountingVisitor : IMftRecordVisitor
+    {
+        public int Count { get; private set; }
+
+        public string? FailureReason => null;
+
+        public bool Visit(MftRecordInfo record)
+        {
+            Count++;
+            return true;
+        }
     }
 
     // ── Sizes ──────────────────────────────────────────────────────────────────────────

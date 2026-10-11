@@ -43,6 +43,14 @@ internal sealed class WindowsMftRecordSource : IMftRecordSource
     public MftGeometry Geometry { get; }
 
     /// <summary>
+    /// Kernel-decoded: <c>FSCTL_GET_NTFS_FILE_RECORD</c> returns each record after the
+    /// filesystem has checked the update sequence tag and restored the saved words over
+    /// the unit tails, so the parser must not check the tag or write the save area back
+    /// a second time.
+    /// </summary>
+    public MftRecordRepresentation Representation => MftRecordRepresentation.FixupApplied;
+
+    /// <summary>
     /// Opens <paramref name="volumeRoot"/> and reads its geometry. Returns false with a
     /// reason for anything that stops the volume being read.
     /// </summary>
