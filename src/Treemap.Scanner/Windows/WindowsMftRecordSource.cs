@@ -47,9 +47,20 @@ internal sealed class WindowsMftRecordSource : IMftRecordSource
     /// reason for anything that stops the volume being read.
     /// </summary>
     public static bool TryOpen(string volumeRoot, out WindowsMftRecordSource? source, out string? failure)
+        => TryOpen(volumeRoot, out source, out failure, out _);
+
+    /// <summary>
+    /// Opens <paramref name="volumeRoot"/> and reads its geometry, also reporting the
+    /// numeric Win32 error when the volume handle or geometry query fails. A zero
+    /// <paramref name="win32Error"/> means success or a non-Win32 failure (unsupported
+    /// geometry, unusable input); the numeric code is what callers match on, never the
+    /// localized message text.
+    /// </summary>
+    public static bool TryOpen(string volumeRoot, out WindowsMftRecordSource? source, out string? failure, out int win32Error)
     {
         source = null;
         failure = null;
+        win32Error = 0;
 
         SafeFileHandle? handle;
 
@@ -75,6 +86,7 @@ internal sealed class WindowsMftRecordSource : IMftRecordSource
             // Read before anything else can overwrite the thread's error, including the
             // dispose that follows.
             int error = Marshal.GetLastWin32Error();
+            win32Error = error;
             handle.Dispose();
             failure = $"The volume '{volumeRoot}' could not be opened: {NativeMethods.DescribeError(error)}";
             return false;
@@ -95,6 +107,7 @@ internal sealed class WindowsMftRecordSource : IMftRecordSource
                     0))
             {
                 int error = Marshal.GetLastWin32Error();
+                win32Error = error;
                 failure = $"The volume '{volumeRoot}' did not answer an NTFS geometry query: {NativeMethods.DescribeError(error)}";
                 return false;
             }

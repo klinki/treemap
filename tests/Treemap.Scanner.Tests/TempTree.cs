@@ -165,6 +165,18 @@ public sealed class WindowsOnlyFactAttribute : FactAttribute
     }
 }
 
+/// <summary>A theory that only makes sense on Windows.</summary>
+public sealed class WindowsOnlyTheoryAttribute : TheoryAttribute
+{
+    public WindowsOnlyTheoryAttribute()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Skip = "Windows-only behaviour.";
+        }
+    }
+}
+
 /// <summary>A fact that only makes sense where a backslash is an ordinary file-name character.</summary>
 public sealed class UnixOnlyFactAttribute : FactAttribute
 {

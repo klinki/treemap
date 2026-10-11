@@ -51,12 +51,14 @@ The status reports the backend, fallback reason, progress, and incomplete result
 Launching without a path does not scan automatically.
 
 ```powershell
-& ./tools/Invoke-Bounded.ps1 -Application dotnet -TimeoutSeconds 300 -Arguments 'src/Treemap.Host.WinForms/bin/Release/net10.0-windows/TreemapHost.dll'
+& ./tools/Invoke-Bounded.ps1 -Application dotnet -TimeoutSeconds 300 -Arguments 'src/Treemap.Host.WinForms/bin/Release/net10.0-windows/TreemapHost.dll --no-elevation'
 ```
 
 Append a quoted directory path to that argument string to scan it after the window
 opens. The wrapper closes the entire application at its deadline or memory limit;
-choose a suitable deadline for an interactive session.
+choose a suitable deadline for an interactive session. `--no-elevation` disables the
+automatic UAC restart below, which every bounded session should pass: a
+broker-created elevated process does not inherit the wrapper's job limits.
 
 The scanner is also usable without the desktop host:
 
@@ -81,8 +83,16 @@ results. Cancellation before publication throws and preserves the previous snaps
 `FileSystemScanner.GetReadyVolumesAsync` lists ready volumes. `ScanOptions.Backend`
 can force portable enumeration. Auto tries NTFS on Windows and falls back to
 directory enumeration when a volume cannot be opened, its metadata is unsupported,
-or a record cannot be trusted. Access denied is reported without requesting elevation.
-UNC paths and other filesystems use the portable backend.
+or a record cannot be trusted. The scanner library reports access denied without
+requesting elevation. UNC paths and other filesystems use the portable backend.
+
+The desktop host restarts itself automatically when a selected NTFS scan needs raw
+volume access the current process lacks: it probes read-only access first, then
+relaunches its own executable with `runas` and resumes the absolute chosen root in
+the elevated window. Declining UAC or a failed launch keeps the original window and
+runs the regular scan with an explanation. Pass `--no-elevation` to disable the
+automatic restart; an elevated child started this way does not inherit the bounded
+runner's limits.
 
 The default limits are two directory workers, 500,000 entries and diagnostics
 combined, directory depth 256, and 200 retained diagnostics. Hitting a limit marks

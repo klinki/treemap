@@ -1,6 +1,7 @@
 using System.Globalization;
 using Treemap;
 using Treemap.Scanning;
+using Treemap.Scanning.Windows;
 
 namespace Treemap.Host.WinForms;
 
@@ -58,12 +59,30 @@ internal sealed class ScanShell : Form
     private readonly ScanRunner _runner;
     private readonly ScanOptions _options;
 
+    private readonly bool _useProductionScanner;
+    private readonly bool _hasCustomProbe;
+    private readonly ScanAccessProbe _accessProbe;
+    private readonly ElevationCheck _isElevated;
+    private readonly ElevationStarter _launcher;
+    private readonly TrustedExeResolver _trustedExe;
+    private readonly bool _isElevatedRetry;
+    private readonly bool _elevationDisabled;
+
     private string? _startupPath;
     private CancellationTokenSource? _scanCts;
     private int _generation;
     private bool _disposed;
 
-    internal ScanShell(ScanRunner? scanRunner = null, ScanOptions? scanOptions = null, string? startupPath = null)
+    internal ScanShell(
+        ScanRunner? scanRunner = null,
+        ScanOptions? scanOptions = null,
+        string? startupPath = null,
+        bool isElevatedRetry = false,
+        bool disableElevation = false,
+        ScanAccessProbe? accessProbe = null,
+        ElevationCheck? elevationCheck = null,
+        ElevationStarter? elevationLauncher = null,
+        TrustedExeResolver? trustedExeResolver = null)
     {
         Text = "Treemap";
         ClientSize = new Size(1100, 680);
@@ -72,6 +91,14 @@ internal sealed class ScanShell : Form
         BackColor = SystemColors.Control;
 
         _runner = scanRunner ?? RunScanner;
+        _useProductionScanner = scanRunner is null;
+        _hasCustomProbe = accessProbe is not null;
+        _accessProbe = accessProbe ?? DefaultAccessProbe;
+        _isElevated = elevationCheck ?? Elevation.IsProcessElevated;
+        _launcher = elevationLauncher ?? ((exe, root, flag) => Elevation.StartElevated(exe, root, flag));
+        _trustedExe = trustedExeResolver ?? Elevation.ResolveTrustedExePath;
+        _isElevatedRetry = isElevatedRetry;
+        _elevationDisabled = disableElevation;
         _options = scanOptions ?? ScanOptions.Default with
         {
             // The scanner throttles against this itself; a quarter second is often enough
@@ -308,6 +335,12 @@ internal sealed class ScanShell : Form
         CancellationToken cancellationToken)
         => _scanner.ScanAsync(rootPath, publisher, options, progress, cancellationToken);
 
+    private static NtfsAccessResult DefaultAccessProbe(
+        string rootPath,
+        ScanOptions options,
+        CancellationToken cancellationToken)
+        => NtfsAccessProbe.Check(rootPath, options, cancellationToken);
+
     internal void StartScan(string? rootPath)
     {
         if (_disposed || IsScanning)
@@ -347,6 +380,26 @@ internal sealed class ScanShell : Form
             // synchronization context and delivers each report as a posted callback.
             IProgress<ScanProgress> progress = new Progress<ScanProgress>(tick => OnScanProgress(generation, tick));
 
+            (bool relaunched, string? elevationNote) = await TryElevateAsync(rootPath, generation, cts);
+            if (relaunched)
+            {
+                return;
+            }
+
+            // A probe failure that arrived after a cancel or a close must not start a
+            // scan on a window that is gone or no longer wants one.
+            cts.Token.ThrowIfCancellationRequested();
+            if (!IsCurrent(generation))
+            {
+                throw new OperationCanceledException(cts.Token);
+            }
+
+            if (elevationNote is not null)
+            {
+                // Shown now, while the fallback begins, and retained after it finishes.
+                _statusLabel.Text = elevationNote + $" Scanning {rootPath}";
+            }
+
             // No scheduling token: a scan cancelled before it starts still runs and
             // throws from its own cancellation checks.
             ScanResult result = await Task.Run(
@@ -356,6 +409,11 @@ internal sealed class ScanShell : Form
             if (IsCurrent(generation))
             {
                 ShowResult(result);
+
+                if (elevationNote is not null)
+                {
+                    _statusLabel.Text += " " + elevationNote;
+                }
             }
         }
         catch (OperationCanceledException)
@@ -402,6 +460,146 @@ internal sealed class ScanShell : Form
     /// a finished scan is dropped rather than re-filling a label that was cleared.
     /// </summary>
     private bool IsCurrent(int generation) => !_disposed && _scanCts is not null && generation == _generation;
+
+    /// <summary>
+    /// Probes raw NTFS access on a worker and relaunches elevated when it is denied.
+    /// Returns true only after a successful launch, in which case the caller returns
+    /// without scanning; the original window closes and the new process resumes the
+    /// absolute root. A note explains a declined or failed launch before the regular
+    /// fallback runs.
+    /// </summary>
+    private async Task<(bool relaunched, string? note)> TryElevateAsync(
+        string rootPath,
+        int generation,
+        CancellationTokenSource cts)
+    {
+        if (_elevationDisabled || _isElevatedRetry)
+        {
+            return (false, null);
+        }
+
+        if (_options.Backend == ScanBackendPreference.Portable)
+        {
+            return (false, null);
+        }
+
+        if (!_useProductionScanner && !_hasCustomProbe)
+        {
+            return (false, null);
+        }
+
+        NtfsAccessResult access;
+        try
+        {
+            access = await Task.Run(() => _accessProbe(rootPath, _options, cts.Token), CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            // A probe failure is an ordinary fallback, but only while the scan still
+            // wants one: a cancel or close that landed first must win over the fallback.
+            cts.Token.ThrowIfCancellationRequested();
+            if (!IsCurrent(generation) || _disposed)
+            {
+                throw new OperationCanceledException(cts.Token);
+            }
+
+            return (false, null);
+        }
+
+        if (!IsCurrent(generation) || cts.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cts.Token);
+        }
+
+        if (access.Access != NtfsRawAccess.Denied)
+        {
+            return (false, null);
+        }
+
+        bool elevated;
+        try
+        {
+            elevated = _isElevated();
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            elevated = false;
+        }
+
+        if (elevated)
+        {
+            return (false, null);
+        }
+
+        string absolute;
+        try
+        {
+            absolute = Path.GetFullPath(rootPath);
+        }
+        catch (Exception exception) when (exception is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException
+            or System.Security.SecurityException)
+        {
+            return (false, null);
+        }
+
+        if (!IsCurrent(generation) || cts.IsCancellationRequested || _disposed)
+        {
+            throw new OperationCanceledException(cts.Token);
+        }
+
+        string? exe;
+        try
+        {
+            exe = _trustedExe();
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            exe = null;
+        }
+
+        if (exe is null)
+        {
+            return (false, "Elevation was unavailable; running without elevation.");
+        }
+
+        if (!IsCurrent(generation) || cts.IsCancellationRequested || _disposed)
+        {
+            throw new OperationCanceledException(cts.Token);
+        }
+
+        bool started;
+        try
+        {
+            started = _launcher(exe, absolute, Elevation.ElevatedRetryFlag);
+        }
+        catch (System.ComponentModel.Win32Exception exception) when (exception.NativeErrorCode == Elevation.UacDeclined)
+        {
+            return (false, "Elevation was declined; running without elevation.");
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            return (false, $"Elevation failed ({exception.Message}); running without elevation.");
+        }
+
+        if (!started)
+        {
+            return (false, "Elevation failed to start; running without elevation.");
+        }
+
+        if (!_disposed && IsCurrent(generation))
+        {
+            Close();
+        }
+
+        return (true, null);
+    }
 
     private void OnScanProgress(int generation, ScanProgress tick)
     {

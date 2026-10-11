@@ -18,6 +18,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Treemap.Scanner.Tests" />
+    <InternalsVisibleTo Include="TreemapHost" />
+    <InternalsVisibleTo Include="Treemap.Host.WinForms.Tests" />
   </ItemGroup>
 
 </Project>
