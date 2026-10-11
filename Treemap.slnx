@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Treemap.Core/Treemap.Core.csproj" />
+    <Project Path="src/Treemap.Scanner/Treemap.Scanner.csproj" />
     <Project Path="src/Treemap.Skia/Treemap.Skia.csproj" />
     <Project Path="src/Treemap.Host.WinForms/Treemap.Host.WinForms.csproj" />
   </Folder>
@@ -8,6 +9,7 @@
     <Project Path="tests/Treemap.Core.Tests/Treemap.Core.Tests.csproj" />
     <Project Path="tests/Treemap.Host.WinForms.Tests/Treemap.Host.WinForms.Tests.csproj" />
     <Project Path="tests/Treemap.Perf.Tests/Treemap.Perf.Tests.csproj" />
+    <Project Path="tests/Treemap.Scanner.Tests/Treemap.Scanner.Tests.csproj" />
     <Project Path="tests/Treemap.Performance/Treemap.Performance.csproj" />
     <Project Path="tests/Treemap.Skia.Tests/Treemap.Skia.Tests.csproj" />
   </Folder>

@@ -25,6 +25,18 @@ internal static class StaRunner
 
         Thread thread = new(() =>
         {
+            // Fail fast on a worker touching a control: without this the bad call
+            // marshals or tears down on the wrong thread and hangs at dispose.
+            Control.CheckForIllegalCrossThreadCalls = true;
+
+            // DoEvents installs a context on the first loop and uninstalls it at the
+            // last exit, which drops the UI context a later StartScan captured.
+            // A scoped context with AutoInstall off survives those pumps.
+            bool oldAutoInstall = WindowsFormsSynchronizationContext.AutoInstall;
+            SynchronizationContext? oldContext = SynchronizationContext.Current;
+            WindowsFormsSynchronizationContext.AutoInstall = false;
+            WindowsFormsSynchronizationContext scoped = new();
+            SynchronizationContext.SetSynchronizationContext(scoped);
             try
             {
                 body();
@@ -32,6 +44,12 @@ internal static class StaRunner
             catch (Exception ex)
             {
                 failure = ExceptionDispatchInfo.Capture(ex);
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(oldContext);
+                WindowsFormsSynchronizationContext.AutoInstall = oldAutoInstall;
+                scoped.Dispose();
             }
         })
         {

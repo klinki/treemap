@@ -1,9 +1,9 @@
 # Treemap
 
-Windows disk-usage treemap: squarified layout, SkiaSharp rendering, hit-testing, a
-per-frame animation path, and snapshot publication for large trees. Benchmark and
-perf-test data is generated synthetically; **the filesystem scanner that would walk a
-real volume is a subsequent feature and is not implemented yet.**
+Disk-usage treemap with squarified layout, SkiaSharp rendering, hit-testing,
+animation, and immutable snapshot publication. `Treemap.Scanner` scans real
+directories through portable .NET enumeration or a read-only Windows NTFS MFT
+backend. The desktop host uses WinForms; the scanner library targets portable .NET 10.
 
 ## Prerequisites
 
@@ -43,6 +43,65 @@ server and parallel project builds from multiplying process count and memory.
 & ./tools/Invoke-Bounded.ps1 -Application dotnet -LogPath artifacts/verification/tests.log -Arguments 'test Treemap.slnx -c Release --no-restore -m:1 --disable-build-servers -p:UseSharedCompilation=false -p:BuildInParallel=false'
 ```
 
+## Scan a directory
+
+Start the desktop host, then enter a path, browse for a folder, or select a ready
+volume and click Scan. Cancel stops the current scan and keeps the previous tree.
+The status reports the backend, fallback reason, progress, and incomplete results.
+Launching without a path does not scan automatically.
+
+```powershell
+& ./tools/Invoke-Bounded.ps1 -Application dotnet -TimeoutSeconds 300 -Arguments 'src/Treemap.Host.WinForms/bin/Release/net10.0-windows/TreemapHost.dll'
+```
+
+Append a quoted directory path to that argument string to scan it after the window
+opens. The wrapper closes the entire application at its deadline or memory limit;
+choose a suitable deadline for an interactive session.
+
+The scanner is also usable without the desktop host:
+
+```csharp
+using Treemap.Scanning;
+
+var scanner = new FileSystemScanner();
+var result = await scanner.ScanAsync(
+    rootPath,
+    publisher: snapshotPublisher,
+    progress: progress,
+    cancellationToken: cancellationToken);
+```
+
+Reuse the scanner to preserve node IDs for paths present in consecutive scans.
+Scans on one instance run serially. Enumeration, tree assembly, and the optional
+`SnapshotPublisher.Publish` run on background threads. Progress uses the supplied
+`IProgress<ScanProgress>`; construct `Progress<T>` on the UI thread to marshal it.
+The scanner publishes once after enumeration, including explicitly incomplete
+results. Cancellation before publication throws and preserves the previous snapshot.
+
+`FileSystemScanner.GetReadyVolumesAsync` lists ready volumes. `ScanOptions.Backend`
+can force portable enumeration. Auto tries NTFS on Windows and falls back to
+directory enumeration when a volume cannot be opened, its metadata is unsupported,
+or a record cannot be trusted. Access denied is reported without requesting elevation.
+UNC paths and other filesystems use the portable backend.
+
+The default limits are two directory workers, 500,000 entries and diagnostics
+combined, directory depth 256, and 200 retained diagnostics. Hitting a limit marks
+the result incomplete. Entry limits bound counts, not heap bytes; run large scans
+under the hard process limits above. Hidden and system entries are included unless
+`SkipAttributes` requests otherwise. Links retain zero-byte placeholders and are
+never followed; a link selected as the root is rejected.
+
+Logical sizes count the unnamed file stream. Every visible hard-link name receives
+its own node and full size, so totals can count shared clusters repeatedly. The
+native backend reports extra hard-link entries; portable enumeration cannot identify
+them. Windows supplies allocated sizes when available; other platforms report zero
+with a warning. Treemap layout falls back to logical size when allocation is zero,
+including resident or fully sparse data. Free space is added only for a complete
+volume-root scan. Live scans are observations over time, not atomic filesystem snapshots.
+
+See the [scanner design](docs/features/filesystem-scanner/implementation-plan.md)
+and [review evidence](docs/features/filesystem-scanner/verification.md).
+
 ## One real benchmark
 
 `Layout10K` lays out 10,000 generated files plus their folders and free space. `ShortRun` is the default job.
@@ -73,11 +132,20 @@ allocations is invisible to it.
 
 ## Verification (2026-10-11)
 
-All 147 tests passed in Release, including ten hidden WinForms lifecycle/painting tests.
-All nine projects built with zero warnings and errors. Every process run used the
-bounded runner; the final test process tree peaked at 157.8 MiB committed memory.
+All 340 runnable tests passed in Release, including 19 hidden WinForms tests.
+Five scanner tests were explicitly skipped because of platform or symbolic-link
+permissions. All 11 projects built with zero warnings and errors. Every process run
+used the bounded runner; the final test process tree peaked at 169.6 MiB committed
+memory. A small real-directory scan verified publication, stable IDs, limits,
+cancellation, and actual Windows access-denied fallback. See the
+[scanner review evidence](docs/features/filesystem-scanner/verification.md) for details.
 
-One BenchmarkDotNet 0.15.8 ShortRun measurement completed for `Layout10K`: mean
+The native MFT path passed record fixtures; a live native scan remains unverified
+because Windows denied the volume handle. Linux and macOS runtime checks remain
+outstanding.
+
+Before the scanner change, one BenchmarkDotNet 0.15.8 ShortRun measurement completed
+for `Layout10K`: mean
 **1.177 ms**, standard deviation **0.0277 ms**, **1.91 MB allocated per operation**,
 three measured iterations. The 99.9% confidence interval is wide (0.671–1.682 ms);
 this is an initial measurement under the stated caps. The complete benchmark process
@@ -89,5 +157,4 @@ BenchmarkDotNet workload samples establish that the benchmark actually ran.
 
 Known limits: publishing again during an active tween restarts from its previous
 target and can jump. When retained nodes reverse ancestor relationships, a single
-prepared draw order follows the target hierarchy. The filesystem scanner remains
-subsequent feature work.
+prepared draw order follows the target hierarchy.

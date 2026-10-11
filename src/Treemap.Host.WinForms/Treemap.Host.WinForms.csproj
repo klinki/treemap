@@ -16,6 +16,10 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Treemap.Core\Treemap.Core.csproj" />
+    <ProjectReference Include="..\Treemap.Scanner\Treemap.Scanner.csproj" />
     <ProjectReference Include="..\Treemap.Skia\Treemap.Skia.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Treemap.Host.WinForms.Tests" />
   </ItemGroup>
 </Project>
