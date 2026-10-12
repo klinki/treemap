@@ -2,7 +2,7 @@
 
 ## Current state
 
-`awaiting-user-confirmation` for MFT parsing progress. Attempt 005's native
+`fixed` for MFT parsing progress, confirmed by the user on 2026-10-12. Attempt 005's native
 extension support is confirmed. Attempt 004's uncapped scan and
 percentage repair remains confirmed.
 
@@ -16,7 +16,7 @@ percentage repair remains confirmed.
 
 ## Confirmation date
 
-2026-10-12 for attempts 004 and 005. Attempt 006 is not yet confirmed.
+2026-10-12 for attempts 004, 005, and 006.
 The earlier 2026-10-11 confirmation applied to attempt 002.
 
 ## Resolution summary
@@ -153,3 +153,7 @@ User confirmation has now been received for the reported reset and crash.
   4.15 GB table, and approximate time for each pass. The native final map stayed
   at 100% and detail 1 without fallback or reset. The nameless-record warning
   remains documented. Awaiting user confirmation of the new progress behavior.
+
+- 2026-10-12: The user confirmed attempt 006 with "Yes, progress works".
+  Marked the MFT parsing progress repair fixed. Implementation: a2cd59d.
+  The nameless-record warning remains documented; no code or test results changed.

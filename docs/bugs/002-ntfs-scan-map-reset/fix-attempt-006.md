@@ -2,7 +2,7 @@
 
 ## Attempt status
 
-Locally verified on 2026-10-12; awaiting user confirmation of MFT progress.
+Confirmed by the user on 2026-10-12; implementation commit a2cd59d.
 Attempt 005's native extension support is committed as 6784813 and has now been
 confirmed by the user. Its successful native C evidence is preserved.
 
@@ -127,3 +127,11 @@ for the current pass, not a guaranteed finish time or a performance comparison.
 The user separately confirmed attempt 005 during this verification with "Yes,
 native scanning worked". Attempt 006 remains awaiting confirmation of the new
 indexing percentage, size, and time estimate after the local commit.
+
+## User confirmation
+
+On 2026-10-12, the user answered the progress confirmation question with
+"Yes, progress works". This confirms advancing indexing percentages, MFT size,
+and the approximate current-pass time estimate. Attempt 006 is fixed at
+implementation commit a2cd59d. The earlier pending state above is historical.
+The existing nameless-record warning remains outside this progress repair.

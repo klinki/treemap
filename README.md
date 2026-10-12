@@ -302,4 +302,4 @@ A visible C: run showed advancing indexing percentages before any files were
 emitted, a known 4.15 GB MFT table, and approximate remaining time in both passes.
 It retained the native final map at 100% and detail 1. The existing nameless-record
 warning remained. See [attempt 006](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-006.md)
-for live evidence and the pending confirmation of this progress change.
+for live evidence. The user confirmed this progress change on 2026-10-12.
