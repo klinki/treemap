@@ -40,8 +40,10 @@ public class ScanMemoryBudgetTests
     {
         using TempTree tree = new(nameof(LongPathsAndInferredParentsConsumeMoreBudget));
         string prefix = Path.Combine(Enumerable.Repeat(new string('x', 100), 5).ToArray());
-        ScanResult flat = await new FileSystemScanner(Files(), null).ScanAsync(tree.Root, options: Options(32_768));
-        ScanResult deep = await new FileSystemScanner(Files(prefix), null).ScanAsync(tree.Root, options: Options(32_768));
+        // Sized between the flat total (~27KB) and the deep total (~31KB) under the
+        // current table, so the flat scan completes while the deep one stops early.
+        ScanResult flat = await new FileSystemScanner(Files(), null).ScanAsync(tree.Root, options: Options(28_000));
+        ScanResult deep = await new FileSystemScanner(Files(prefix), null).ScanAsync(tree.Root, options: Options(28_000));
 
         Assert.InRange(deep.FileCount, 1, flat.FileCount - 1);
         Assert.Contains("memory budget", deep.IncompleteReason!, StringComparison.Ordinal);
@@ -160,6 +162,47 @@ public class ScanMemoryBudgetTests
         {
             release.Set();
         }
+    }
+
+    [Fact]
+    public void MeasuredCInventoryFitsTheAutomaticCap()
+    {
+        // Independent streaming count: 2,927,443 files + 615,160 folders at ~27
+        // chars average basename. The retained estimate (plus per-folder queued
+        // absolute-path workspace for a short C:\ root) must fit the automatic
+        // cap, or a full C scan stops on budget before enumeration ends.
+        const long Files = 2_927_443;
+        const long Folders = 615_160;
+        const int AvgName = 27;
+        long total = Files * ScanMemoryBudget.EstimateFile(AvgName)
+            + Folders * ScanMemoryBudget.EstimateFolder(AvgName)
+            + Folders * 2L * 3;
+        Assert.True(
+            total <= ScanMemoryBudget.MaxAutomaticBytes,
+            $"C-scale estimate {total:N0} bytes exceeds the {ScanMemoryBudget.MaxAutomaticBytes:N0} byte automatic cap.");
+    }
+
+    [Theory]
+    [InlineData(0, 500)]
+    [InlineData(999_999, 500)]
+    [InlineData(1_000_000, 2000)]
+    [InlineData(2_000_000, 3000)]
+    [InlineData(5_000_000, 3000)]
+    public void LargeTreesSlowPreviewsButSmallTreesKeepCallerInterval(long entries, int expectedMs)
+    {
+        TimeSpan requested = TimeSpan.FromMilliseconds(500);
+        Assert.Equal(TimeSpan.FromMilliseconds(expectedMs), ScanMemoryBudget.PreviewDelay(requested, entries));
+    }
+
+    [Fact]
+    public void LargerCallerPreviewIntervalIsAlwaysHonoured()
+    {
+        Assert.Equal(
+            TimeSpan.FromSeconds(10),
+            ScanMemoryBudget.PreviewDelay(TimeSpan.FromSeconds(10), 5_000_000));
+        Assert.Equal(
+            TimeSpan.FromMilliseconds(10),
+            ScanMemoryBudget.PreviewDelay(TimeSpan.FromMilliseconds(10), 0));
     }
 
     private static ScanOptions Options(long bytes) => TestOptions.Verbose() with { MemoryBudgetBytes = bytes };

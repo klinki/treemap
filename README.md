@@ -110,17 +110,26 @@ runs the regular scan with an explanation. Pass `--no-elevation` to disable the
 automatic restart; an elevated child started this way does not inherit the bounded
 runner's limits.
 
-The default limits are two directory workers, 500,000 entries and diagnostics
-combined, directory depth 256, and 200 retained diagnostics. Hitting a limit marks
-the result incomplete. A separate memory budget estimates retained paths, inferred
-folders, diagnostics, backend workspace, and snapshot construction. It defaults to
-half the managed heap still available at scan start. `ScanOptions.MemoryBudgetBytes`
-can request a smaller allowance. Discovery stops before accepting an entry that
-exceeds it and publishes the discovered data as an explicitly incomplete map,
-including free and unaccounted space for volume scans. This estimate supplements
+The default limits are two directory workers, directory depth 256, and 200 retained
+diagnostics. There is no default entry-count limit; callers can set `MaxEntries`.
+Hitting a limit marks the result incomplete. A memory budget estimates file nodes,
+basenames, folders, diagnostics, backend workspace, and snapshot construction. It
+defaults to 85 percent of the managed heap still available at scan start, capped
+at 1.3 GB.
+`ScanOptions.MemoryBudgetBytes` can request a smaller allowance. Discovery stops
+before accepting an entry that exceeds it. It publishes discovered data as an
+explicitly incomplete map, including free and unaccounted space for volume scans.
+This estimate supplements
 the hard process limits above. Hidden and system entries are included unless
 `SkipAttributes` requests otherwise. Links retain zero-byte placeholders and are
 never followed; a link selected as the root is rejected.
+
+The in-memory tree stores basenames and shares immutable file nodes across previews.
+Finalization releases working dictionaries as it freezes folders. Snapshot lookups
+use compact pages for dense IDs and a dictionary for sparse IDs. Large scans slow
+previews to reduce allocation pressure. If an intermediate preview runs out of
+memory before publication, previews pause and enumeration continues toward the
+final map; final allocation failures still fail the scan.
 
 Logical sizes count the unnamed file stream. Every visible hard-link name receives
 its own node and full size, so totals can count shared clusters repeatedly. The
@@ -244,3 +253,13 @@ BenchmarkDotNet workload samples establish that the benchmark actually ran.
 Live previews received during an active tween snap to the newest layout. Other
 interrupted transitions can still jump from the previous target. When retained nodes
 reverse ancestor relationships, the prepared draw order follows the target hierarchy.
+
+## Large-scan verification (2026-10-12)
+
+All 610 affected Core, scanner, desktop, and Skia tests passed; six scanner tests
+were skipped. An elevated C: scan enumerated 3,542,813 entries and published the
+final map in 179.1 seconds. Peak job memory was 1.52 GB under the 2 GB app budget.
+Every recorded frame remained at default detail 1. NTFS declined fragmented
+attributes, so the portable fallback completed the accessible inventory; protected
+paths remain reported as unreadable. See
+[attempt 003](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-003.md) for limits and evidence.

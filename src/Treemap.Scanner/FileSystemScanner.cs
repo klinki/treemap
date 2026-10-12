@@ -35,6 +35,13 @@ public sealed class FileSystemScanner
     private readonly IScanBackend? _ntfsOverride;
     private readonly Func<string, VolumeSpaceInfo?> _volumeSpaceProvider;
 
+    /// <summary>
+    /// Test seam: when set, the preview timer invokes it before each intermediate
+    /// publish and throws the returned exception, simulating an allocation failure
+    /// before anything became visible. The final build never consults it.
+    /// </summary>
+    internal Func<Exception?>? PreviewAllocationFault { get; set; }
+
     /// <summary>Creates a scanner that picks the best backend for each root.</summary>
     public FileSystemScanner()
     {
@@ -236,6 +243,9 @@ public sealed class FileSystemScanner
         // and the next rescan use. Only a finished scan commits; anything else aborts
         // and keeps the last good map.
         _ids.BeginBuild(fullRootPath);
+        // From here every accepted entry reserves its (parentId, basename) id at add time
+        // and file nodes are created once and shared by all previews and the final tree.
+        collector.AttachIds(_ids);
 
         PreviewLoop? previews = null;
         TreemapSnapshot? snapshot = null;
@@ -245,7 +255,7 @@ public sealed class FileSystemScanner
             if (wantPreviews)
             {
                 previews = new PreviewLoop(
-                    collector, publisher!, _ids, fullRootPath, options, GetVolumeSpace, publisher!.Current, cancellationToken);
+                    collector, publisher!, _ids, fullRootPath, options, GetVolumeSpace, publisher!.Current, cancellationToken, PreviewAllocationFault);
 
                 // Synchronous initial basis on the scanning thread, before any backend
                 // runs: an empty root with the cached free/unaccounted blocks. Later
@@ -292,6 +302,9 @@ public sealed class FileSystemScanner
                         else
                         {
                             collector.Reset();
+                            // Forget the abandoned walk's hierarchical reservations too, so
+                            // only ids in returned trees carry over to the next build.
+                            _ids.BeginBuild(fullRootPath);
                         }
                     }
                 }
@@ -325,7 +338,12 @@ public sealed class FileSystemScanner
             previews?.Stop();
             previews?.ThrowIfFaulted();
 
-            TreemapNode root = ScanTreeBuilder.Build(fullRootPath, collector.Entries, _ids, cancellationToken);
+            // Enumeration has joined and previews have drained. Build the final
+            // immutable folders destructively from the mutable tree, releasing
+            // sibling dictionaries as each folder is frozen. This avoids holding a
+            // full FolderSnapshot copy alongside the working tree at the peak;
+            // shared file nodes, counters, pending ids and prior snapshots stay.
+            TreemapNode root = collector.BuildFinalTreeDestructive(fullRootPath, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
 
             // Volume space belongs to a volume, so it is only attached when the scan
@@ -580,12 +598,14 @@ public sealed class FileSystemScanner
         private readonly Func<VolumeSpaceInfo?> _volumeSpace;
         private readonly TreemapSnapshot _prior;
         private readonly CancellationToken _cancellationToken;
+        private readonly Func<Exception?>? _previewFault;
         private readonly object _gate = new();
         private Timer? _timer;
         private long _published;
         private long _builtEntries;
         private bool _stopped;
         private bool _poisoned;
+        private bool _previewOomPaused;
         private ExceptionDispatchInfo? _fault;
 
         public PreviewLoop(
@@ -596,7 +616,8 @@ public sealed class FileSystemScanner
             ScanOptions options,
             Func<VolumeSpaceInfo?> volumeSpace,
             TreemapSnapshot prior,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            Func<Exception?>? previewFault = null)
         {
             _collector = collector;
             _publisher = publisher;
@@ -607,13 +628,14 @@ public sealed class FileSystemScanner
             _volumeSpace = volumeSpace;
             _prior = prior;
             _cancellationToken = cancellationToken;
+            _previewFault = previewFault;
         }
 
         public void Start()
         {
             lock (_gate)
             {
-                _timer = new Timer(Callback, null, DueDelay(), Timeout.InfiniteTimeSpan);
+                _timer = new Timer(Callback, null, DueDelay(0), Timeout.InfiniteTimeSpan);
             }
         }
 
@@ -637,15 +659,7 @@ public sealed class FileSystemScanner
 
         private void PublishInitialBasisLocked()
         {
-            if (_stopped || _poisoned)
-            {
-                return;
-            }
-
-            _cancellationToken.ThrowIfCancellationRequested();
-
-            TreemapNode? initial = BuildInitialRoot();
-            if (initial is null)
+            if (_stopped || _poisoned || _previewOomPaused)
             {
                 return;
             }
@@ -655,7 +669,29 @@ public sealed class FileSystemScanner
             long before = _publisher.Current.Version;
             try
             {
+                TreemapNode? initial = BuildInitialRoot();
+                if (initial is null)
+                {
+                    return;
+                }
+
+                _cancellationToken.ThrowIfCancellationRequested();
                 _publisher.Publish(initial, _fullRootPath);
+            }
+            catch (OutOfMemoryException)
+            {
+                // Allocation-only failure before anything became visible pauses
+                // previews and lets enumeration continue to the final tree. A
+                // version move means a subscriber threw after the map was
+                // visible, which stays a scan failure.
+                if (_publisher.Current.Version != before)
+                {
+                    throw;
+                }
+
+                _previewOomPaused = true;
+                NotePreviewOom();
+                return;
             }
             finally
             {
@@ -781,6 +817,7 @@ public sealed class FileSystemScanner
 
                 if (Interlocked.Read(ref _published) > 0 && !_stopped)
                 {
+                    long restoreBefore = _publisher.Current.Version;
                     try
                     {
                         _publisher.Publish(_prior.Root, _prior.RootPath);
@@ -788,6 +825,21 @@ public sealed class FileSystemScanner
                     catch (OperationCanceledException)
                     {
                         throw;
+                    }
+                    catch (OutOfMemoryException oom)
+                    {
+                        // Allocation-only restore failure pauses previews; a version
+                        // move means a subscriber threw after the map was visible.
+                        if (_publisher.Current.Version != restoreBefore)
+                        {
+                            _fault ??= ExceptionDispatchInfo.Capture(oom);
+                            _poisoned = true;
+                        }
+                        else
+                        {
+                            _previewOomPaused = true;
+                            NotePreviewOom();
+                        }
                     }
                     catch (Exception exception)
                     {
@@ -837,11 +889,18 @@ public sealed class FileSystemScanner
             }
         }
 
-        private TimeSpan DueDelay()
-            => _options.SnapshotInterval < MinSnapshotDelay ? MinSnapshotDelay : _options.SnapshotInterval;
+        private TimeSpan DueDelay(long entryCount)
+        {
+            TimeSpan baseDelay = _options.SnapshotInterval < MinSnapshotDelay ? MinSnapshotDelay : _options.SnapshotInterval;
+            // Large trees capture O(N) references per preview; the floor lets the
+            // UI finish animating and older snapshots collect first. Small trees
+            // keep the caller's interval exactly.
+            return ScanMemoryBudget.PreviewDelay(baseDelay, entryCount);
+        }
 
         private void Callback(object? state)
         {
+
             // A build already running means this tick is stale before it starts: skip it
             // rather than queueing, and let the next tick see newer data.
             if (!Monitor.TryEnter(_gate))
@@ -850,9 +909,12 @@ public sealed class FileSystemScanner
                 return;
             }
 
+            // Capture after acquiring the gate so an earlier preview or fallback
+            // cannot make this allocation failure look like a subscriber failure.
+            long entryVersion = _publisher.Current.Version;
             try
             {
-                if (_stopped || _poisoned)
+                if (_stopped || _poisoned || _previewOomPaused)
                 {
                     return;
                 }
@@ -860,22 +922,28 @@ public sealed class FileSystemScanner
                 _cancellationToken.ThrowIfCancellationRequested();
 
                 // The count is read first so an unchanged entry set costs no tree copy.
-                int count = _collector.EntryCount;
+                // Counts are files plus explicit folders; inferred parents never move it.
+                long count = _collector.TotalEntryCount;
                 if (count == 0 || count == _builtEntries)
                 {
                     return;
                 }
 
-                (ScanEntry[] entries, long represented) = _collector.CapturePreview();
+                // Frozen outside the collector gate: folder aggregates rebuilt over the
+                // shared file instances. Each capture allocates one reference array per
+                // folder plus the frozen child arrays of the built nodes (O(files)
+                // references transient); no full-path-per-file list is ever materialised.
+                (ManagedScanTree.FolderSnapshot snap, long represented) = _collector.CaptureTreeSnapshot();
 
                 // Empty trees carry no information, and an unchanged entry set means
                 // the same tree as last time: publish neither, and never repeatedly.
-                if (entries.Length == 0 || entries.Length == _builtEntries)
+                long snapCount = CountSnapshotEntries(snap);
+                if (snapCount == 0 || snapCount == _builtEntries)
                 {
                     return;
                 }
 
-                TreemapNode root = ScanTreeBuilder.Build(_fullRootPath, entries, _ids, _cancellationToken);
+                TreemapNode root = ScanCollector.BuildFromSnapshot(_fullRootPath, snap, _cancellationToken);
 
                 // Volume metadata is read only for volume roots, and only when the
                 // entry set actually changed: a folder scan never touches the provider.
@@ -890,12 +958,20 @@ public sealed class FileSystemScanner
                     }
                 }
 
-                if (_stopped)
+                if (_stopped || _previewOomPaused)
                 {
                     return;
                 }
 
                 _cancellationToken.ThrowIfCancellationRequested();
+
+                // Test seam: simulate an allocation failure before anything became
+                // visible. The final build never consults it.
+                Exception? injected = _previewFault?.Invoke();
+                if (injected is not null)
+                {
+                    throw injected;
+                }
 
                 long before = _publisher.Current.Version;
                 try
@@ -909,7 +985,7 @@ public sealed class FileSystemScanner
                     // so cancellation and failure restore the prior map.
                     if (_publisher.Current.Version != before)
                     {
-                        _builtEntries = entries.Length;
+                        _builtEntries = snapCount;
                         Interlocked.Increment(ref _published);
                     }
                 }
@@ -926,6 +1002,24 @@ public sealed class FileSystemScanner
             {
                 // The scan is unwinding; it stops this loop and restores the prior map.
             }
+            catch (OutOfMemoryException oom)
+            {
+                // Allocation-only preview loss: nothing became visible, so the last
+                // good map stays on screen and enumeration continues to the final
+                // tree. A version move means a subscriber threw OutOfMemory after
+                // the map was visible, which stays a scan failure like any other
+                // subscriber fault. The final build's own OOM is never caught here.
+                if (_publisher.Current.Version != entryVersion)
+                {
+                    _fault ??= ExceptionDispatchInfo.Capture(oom);
+                    _poisoned = true;
+                }
+                else
+                {
+                    _previewOomPaused = true;
+                    NotePreviewOom();
+                }
+            }
             catch (Exception exception)
             {
                 // Never fault the scan from a pool thread. Record the first failure and
@@ -941,29 +1035,65 @@ public sealed class FileSystemScanner
             }
         }
 
+        private static long CountSnapshotEntries(ManagedScanTree.FolderSnapshot snap)
+        {
+            // Files plus explicitly recorded folders only, matching TotalEntryCount so the
+            // unchanged-set fast path compares like with like. Inferred parents exist for
+            // structure, never for counting.
+            long count = snap.Files.Length;
+            foreach (ManagedScanTree.FolderSnapshot sub in snap.Subfolders)
+            {
+                count += (sub.Explicit ? 1 : 0) + CountSnapshotEntries(sub);
+            }
+
+            return count;
+        }
+
         private void Reschedule()
         {
             Timer? timer;
             bool stopped;
             bool poisoned;
+            bool oomPaused;
 
             lock (_gate)
             {
                 timer = _timer;
                 stopped = _stopped;
                 poisoned = _poisoned;
+                oomPaused = _previewOomPaused;
             }
 
-            if (timer is null || stopped || poisoned)
+            if (timer is null || stopped || poisoned || oomPaused)
             {
                 return;
             }
 
             try
             {
-                timer.Change(DueDelay(), Timeout.InfiniteTimeSpan);
+                timer.Change(DueDelay(_collector.TotalEntryCount), Timeout.InfiniteTimeSpan);
             }
             catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        /// <summary>
+        /// Best-effort warning that previews stopped for memory while the final tree
+        /// is still built. A warning never clears <see cref="ScanCollector.IsComplete"/>;
+        /// a second OOM here is swallowed so the enumeration still reaches the final.
+        /// Caller holds the preview gate.
+        /// </summary>
+        private void NotePreviewOom()
+        {
+            try
+            {
+                _collector.AddDiagnostic(
+                    _fullRootPath,
+                    "Intermediate previews stopped after running out of memory; the final tree is still being built.",
+                    ScanDiagnosticSeverity.Warning);
+            }
+            catch (OutOfMemoryException)
             {
             }
         }

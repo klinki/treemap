@@ -626,7 +626,8 @@ public class NtfsMftScanBackendTests
     [Fact]
     public void EntryPassMemoryLimitReturnsAcceptedDataInsteadOfDeclining()
     {
-        ScanOptions options = ScanOptions.Default with { MemoryBudgetBytes = 4096 };
+        // Enough for the directory map and some entries, but not the full fixture.
+        ScanOptions options = ScanOptions.Default with { MemoryBudgetBytes = 3500 };
         ScanCollector collector = Collector(options);
 
         Assert.True(Backend(Volume()).TryRun(Request(VolumeRootPath, options), collector, out string? reason), reason);

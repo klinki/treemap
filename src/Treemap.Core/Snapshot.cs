@@ -22,8 +22,43 @@ namespace Treemap;
 /// </remarks>
 public sealed class TreemapSnapshot
 {
-    private readonly Dictionary<int, TreemapNode> _nodesById;
-    private readonly Dictionary<int, int> _parentById;
+    private readonly struct Lookup(int parentId, TreemapNode node)
+    {
+        public readonly int ParentId = parentId;
+        public readonly TreemapNode Node = node;
+    }
+
+    /// <summary>
+    /// One page of a paged index. Each page holds 4096 ids: 32KB of references
+    /// plus 16KB of parent ids, both below the large-object heap so a 3.5M-node
+    /// production tree never needs a single ~140MB contiguous dictionary array.
+    /// Pages are filled during construction only and never mutated afterwards.
+    /// </summary>
+    private sealed class Page
+    {
+        public readonly TreemapNode?[] Nodes = new TreemapNode?[PageSize];
+        public readonly int[] Parents = new int[PageSize];
+    }
+
+    private const int PageShift = 12;
+    private const int PageSize = 1 << PageShift;
+    private const int PageMask = PageSize - 1;
+
+    /// <summary>
+    /// At least half of each page is used on average so paging reduces memory. Dense
+    /// production ids average thousands per page; sparse or tiny trees stay on
+    /// the dictionary fallback so one node never costs a full 48KB page.
+    /// </summary>
+    private const int MinAvgEntriesPerPage = PageSize / 2;
+
+    /// <summary>
+    /// One index for both lookups: id to (node, parent). Dense production trees
+    /// use the paged directory; small or very sparse trees use the dictionary.
+    /// Exactly one of the two is non-null. The root's parent is -1.
+    /// </summary>
+    private readonly Dictionary<int, Page>? _pages;
+    private readonly Dictionary<int, Lookup>? _sparse;
+    private readonly int _nodeCount;
 
     public TreemapSnapshot(TreemapNode root, long version, DateTimeOffset timestamp, string? rootPath = null)
     {
@@ -34,13 +69,32 @@ public sealed class TreemapSnapshot
         Timestamp = timestamp;
         RootPath = rootPath;
 
-        // Pre-size both maps from a counting pass to avoid resize array overlap.
-        int count = CountNodes(root);
-        Dictionary<int, TreemapNode> map = new(count);
-        Dictionary<int, int> parents = new(count);
-        Index(map, parents, root, parentId: -1);
-        _nodesById = map;
-        _parentById = parents;
+        // Counting pass sizes the index without resize overlap and collects the
+        // distinct page keys (tiny for dense production ids) to pick the index shape.
+        int visits = 0;
+        HashSet<int> pageKeys = [];
+        CountVisits(root, ref visits, pageKeys);
+
+        // Average occupancy from visits (duplicates harmlessly over-count) over
+        // distinct pages. A root outlier (id 1 with descendants at 100M+) adds a
+        // single extra page key, so dense production trees still page; min/max id
+        // range alone is never used because it would falsely fall back there.
+        if (pageKeys.Count > 0 && (long)visits >= (long)pageKeys.Count * MinAvgEntriesPerPage)
+        {
+            Dictionary<int, Page> pages = new(pageKeys.Count);
+            int unique = 0;
+            IndexPaged(pages, root, parentId: -1, ref unique);
+            _pages = pages;
+            _nodeCount = unique;
+        }
+        else
+        {
+            // Small or very sparse trees: a dictionary avoids one 48KB page per node.
+            Dictionary<int, Lookup> map = new(visits);
+            Index(map, root, parentId: -1);
+            _sparse = map;
+            _nodeCount = map.Count;
+        }
     }
 
     public TreemapNode Root { get; }
@@ -57,15 +111,72 @@ public sealed class TreemapSnapshot
     /// </summary>
     public string? RootPath { get; }
 
-    public int NodeCount => _nodesById.Count;
+    public int NodeCount => _nodeCount;
 
-    public bool TryGetNode(int id, out TreemapNode node) => _nodesById.TryGetValue(id, out node!);
+    /// <summary>
+    /// Single lookup path for both index shapes. Never exposes mutable backing arrays.
+    /// </summary>
+    private bool TryLookup(int id, out TreemapNode node, out int parentId)
+    {
+        if (_pages is not null)
+        {
+            int pageKey = id >> PageShift;
+            int offset = id & PageMask;
+            if (_pages.TryGetValue(pageKey, out Page? page))
+            {
+                TreemapNode? found = page.Nodes[offset];
+                if (found is not null)
+                {
+                    node = found;
+                    parentId = page.Parents[offset];
+                    return true;
+                }
+            }
+
+            node = null!;
+            parentId = 0;
+            return false;
+        }
+
+        if (_sparse!.TryGetValue(id, out Lookup foundSparse))
+        {
+            node = foundSparse.Node;
+            parentId = foundSparse.ParentId;
+            return true;
+        }
+
+        node = null!;
+        parentId = 0;
+        return false;
+    }
+
+    public bool TryGetNode(int id, out TreemapNode node)
+    {
+        if (TryLookup(id, out TreemapNode found, out _))
+        {
+            node = found;
+            return true;
+        }
+
+        node = null!;
+        return false;
+    }
 
     /// <summary>
     /// The true parent of a node in the whole snapshot, indexed once per publish.
     /// Returns false for the root and for unknown ids.
     /// </summary>
-    public bool TryGetParent(int id, out int parentId) => _parentById.TryGetValue(id, out parentId);
+    public bool TryGetParent(int id, out int parentId)
+    {
+        if (TryLookup(id, out TreemapNode found, out int foundParent) && !ReferenceEquals(found, Root))
+        {
+            parentId = foundParent;
+            return true;
+        }
+
+        parentId = 0;
+        return false;
+    }
 
     /// <summary>
     /// Display path of a node, built from the snapshot alone with no filesystem I/O.
@@ -75,18 +186,18 @@ public sealed class TreemapSnapshot
     /// </summary>
     public string GetPath(int id)
     {
-        if (!_nodesById.TryGetValue(id, out TreemapNode? node))
+        if (!TryLookup(id, out TreemapNode found, out _))
         {
             return id.ToString(CultureInfo.InvariantCulture);
         }
 
-        List<string> segments = [node.Name];
+        List<string> segments = [found.Name];
         int current = id;
-        while (_parentById.TryGetValue(current, out int parent)
-            && _nodesById.TryGetValue(parent, out TreemapNode? parentNode))
+        while (TryGetParent(current, out int stepParent)
+            && TryLookup(stepParent, out TreemapNode parentNode, out _))
         {
             segments.Add(parentNode.Name);
-            current = parent;
+            current = stepParent;
         }
 
         segments.Reverse();
@@ -113,36 +224,58 @@ public sealed class TreemapSnapshot
         => new(root, version, DateTimeOffset.UtcNow, rootPath);
 
     /// <summary>
-    /// Counts nodes so the lookup dictionaries can be pre-sized.
-    /// Duplicate ids count once per visit: slight over-sizing is harmless.
+    /// Counting pass: visits size the index without resize overlap, and distinct
+    /// page keys pick the paged versus dictionary shape. Duplicate ids count once
+    /// per visit: slight over-sizing is harmless.
     /// </summary>
-    private static int CountNodes(TreemapNode node)
+    private static void CountVisits(TreemapNode node, ref int visits, HashSet<int> pageKeys)
     {
-        int count = 1;
         checked
         {
-            IReadOnlyList<TreemapNode> children = node.Children;
-            for (int i = 0; i < children.Count; i++)
-            {
-                count += CountNodes(children[i]);
-            }
+            visits++;
         }
 
-        return count;
+        pageKeys.Add(node.Id >> PageShift);
+
+        IReadOnlyList<TreemapNode> children = node.Children;
+        for (int i = 0; i < children.Count; i++)
+        {
+            CountVisits(children[i], ref visits, pageKeys);
+        }
     }
 
-    private static void Index(
-        Dictionary<int, TreemapNode> map, Dictionary<int, int> parents, TreemapNode node, int parentId)
+    private static void IndexPaged(Dictionary<int, Page> pages, TreemapNode node, int parentId, ref int unique)
     {
-        map[node.Id] = node;
-        if (parentId >= 0)
+        int pageKey = node.Id >> PageShift;
+        int offset = node.Id & PageMask;
+        if (!pages.TryGetValue(pageKey, out Page? page))
         {
-            parents[node.Id] = parentId;
+            page = new Page();
+            pages[pageKey] = page;
         }
+
+        // Last depth-first visit wins; NodeCount grows only for a fresh slot.
+        if (page.Nodes[offset] is null)
+        {
+            unique++;
+        }
+
+        page.Nodes[offset] = node;
+        page.Parents[offset] = parentId;
 
         foreach (TreemapNode child in node.Children)
         {
-            Index(map, parents, child, node.Id);
+            IndexPaged(pages, child, node.Id, ref unique);
+        }
+    }
+
+    private static void Index(Dictionary<int, Lookup> map, TreemapNode node, int parentId)
+    {
+        map[node.Id] = new Lookup(parentId, node);
+
+        foreach (TreemapNode child in node.Children)
+        {
+            Index(map, child, node.Id);
         }
     }
 }

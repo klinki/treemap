@@ -705,6 +705,156 @@ public class ScanPreviewTests
         Assert.Equal(1, result.FileCount);
     }
 
+    [Fact]
+    public async Task PreviewAllocationOomPausesPreviewsAndFinalStillCompletes()
+    {
+        SnapshotPublisher publisher = TestPublisher.Empty();
+        TreemapSnapshot prior = publisher.Current;
+
+        GatedBackend backend = new(ScanBackend.Portable);
+        backend.Entries.Add(new ScanEntry("a.txt", NodeKind.File, 10, 10, null));
+        backend.Entries.Add(new ScanEntry("b.txt", NodeKind.File, 20, 20, null));
+        backend.Entries.Add(new ScanEntry(Path.Combine("sub", "c.txt"), NodeKind.File, 30, 30, null));
+
+        FileSystemScanner scanner = new(backend, null);
+        int faults = 0;
+        scanner.PreviewAllocationFault = () =>
+            Interlocked.Increment(ref faults) == 1
+                ? new OutOfMemoryException("simulated preview allocation failure")
+                : null;
+
+        Task<ScanResult> scan = scanner.ScanAsync(
+            FakeRoot(nameof(PreviewAllocationOomPausesPreviewsAndFinalStillCompletes)), publisher, PreviewOptions());
+
+        try
+        {
+            Assert.True(backend.Entered.Wait(Timeout), "The backend never started.");
+            // Give the timer a window to attempt the preview and pause on OOM.
+            await Task.Delay(500);
+
+            backend.Release.Set();
+            ScanResult result = await scan;
+
+            Assert.Equal(1, faults);
+            Assert.Equal(3, result.FileCount);
+            Assert.NotNull(TreeAssert.Find(result.Root, "a.txt"));
+            Assert.NotNull(TreeAssert.Find(result.Root, "b.txt"));
+            Assert.NotNull(TreeAssert.Find(result.Root, "sub", "c.txt"));
+            // The final full tree still published; no empty restore from the lost preview.
+            Assert.Same(result.Root, publisher.Current.Root);
+            Assert.NotSame(prior.Root, publisher.Current.Root);
+            // A paused preview is a lost optional view, not a truncated inventory.
+            Assert.True(result.IsComplete);
+            Assert.Contains(result.Diagnostics, d =>
+                d.Severity == ScanDiagnosticSeverity.Warning &&
+                d.Message.Contains("previews stopped", StringComparison.OrdinalIgnoreCase));
+
+            // Identity committed by the final tree survives: a rescan keeps it.
+            int finalId = TreeAssert.Find(result.Root, "a.txt")!.Id;
+            ScanResult second = await scanner.ScanAsync(result.RootPath, options: TestOptions.Verbose());
+            Assert.Equal(finalId, TreeAssert.Find(second.Root, "a.txt")!.Id);
+        }
+        finally
+        {
+            backend.Release.Set();
+        }
+    }
+
+    [Fact]
+    public async Task PreviewSubscriberOomAfterPublishFailsScanAndRestoresPriorMap()
+    {
+        SnapshotPublisher publisher = TestPublisher.Empty();
+        TreemapSnapshot prior = publisher.Current;
+        int calls = 0;
+        publisher.Published += () =>
+        {
+            // The snapshot is already visible when handlers run, so this OOM is a
+            // subscriber failure and must fail the scan like any other handler fault.
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                throw new OutOfMemoryException("subscriber ran out of memory");
+            }
+        };
+
+        GatedBackend backend = new(ScanBackend.Portable);
+        backend.Entries.Add(new ScanEntry("a.txt", NodeKind.File, 10, 10, null));
+
+        FileSystemScanner scanner = new(backend, null);
+        string scanRoot = FakeRoot(nameof(PreviewSubscriberOomAfterPublishFailsScanAndRestoresPriorMap));
+        Task<ScanResult> scan = scanner.ScanAsync(
+            scanRoot, publisher, PreviewOptions());
+
+        int abandonedId;
+        try
+        {
+            Assert.True(backend.Entered.Wait(Timeout), "The backend never started.");
+            TreemapSnapshot preview = await WaitForPreviewAsync(publisher, 0);
+            abandonedId = TreeAssert.Find(preview.Root, "a.txt")!.Id;
+
+            backend.Release.Set();
+            OutOfMemoryException error = await Assert.ThrowsAsync<OutOfMemoryException>(() => scan);
+            Assert.Equal("subscriber ran out of memory", error.Message);
+            Assert.Same(prior.Root, publisher.Current.Root);
+
+            // One preview plus its restore; the unchanged entries never republished.
+            Assert.Equal(2, calls);
+        }
+        finally
+        {
+            backend.Release.Set();
+        }
+
+        // The failed build aborted its ids: the same root rescanned mints a fresh id.
+        // Release stays set, so the gated retry runs straight through.
+        ScanResult second = await scanner.ScanAsync(scanRoot, options: TestOptions.Verbose());
+        Assert.NotEqual(abandonedId, TreeAssert.Find(second.Root, "a.txt")!.Id);
+    }
+
+    [Fact]
+    public async Task CancelAfterPausedPreviewRestoresPriorSource()
+    {
+        SnapshotPublisher publisher = PublisherWithSource("prior-source");
+        TreemapSnapshot prior = publisher.Current;
+
+        TwoStageBackend backend = new();
+        FileSystemScanner scanner = new(backend, null);
+        int faults = 0;
+        scanner.PreviewAllocationFault = () =>
+            // First preview (one entry) succeeds; the second (two entries) loses
+            // its allocation and pauses. Cancellation must still restore the prior.
+            Interlocked.Increment(ref faults) == 2
+                ? new OutOfMemoryException("simulated second-preview allocation failure")
+                : null;
+
+        using CancellationTokenSource cts = new();
+        Task<ScanResult> scan = scanner.ScanAsync(
+            FakeRoot(nameof(CancelAfterPausedPreviewRestoresPriorSource)), publisher, PreviewOptions(), cancellationToken: cts.Token);
+
+        try
+        {
+            Assert.True(backend.Entered.Wait(Timeout), "The backend never started.");
+            TreemapSnapshot first = await WaitForPreviewAsync(publisher, prior.Version);
+            Assert.NotNull(TreeAssert.Find(first.Root, "first.txt"));
+
+            // Let the backend add the second entry; its preview then OOMs and pauses.
+            backend.ContinueSecond.Set();
+            Assert.True(backend.AddedSecond.Wait(Timeout), "The backend never added the second entry.");
+            await Task.Delay(600);
+
+            cts.Cancel();
+            backend.Release.Set();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => scan);
+            Assert.Same(prior.Root, publisher.Current.Root);
+            Assert.Equal("prior-source", publisher.Current.RootPath);
+        }
+        finally
+        {
+            backend.Release.Set();
+            backend.ContinueSecond.Set();
+        }
+    }
+
     private static SnapshotPublisher PublisherWithSource(string source)
         => new(TreemapNode.Create(ScanIdMap.RootId, "empty", NodeKind.Drive), source);
 
@@ -809,6 +959,43 @@ public class ScanPreviewTests
 
             failureReason = Succeeds ? null : FailureReason ?? "the gated backend declined";
             return Succeeds;
+        }
+    }
+
+    /// <summary>
+    /// Adds one entry, lets the first preview publish, then adds a second entry so
+    /// the next preview is the one under test (OOM-pause), then blocks until
+    /// released or cancelled.
+    /// </summary>
+    private sealed class TwoStageBackend : IScanBackend
+    {
+        public ScanBackend Id => ScanBackend.Portable;
+
+        public ManualResetEventSlim Entered { get; } = new(false);
+
+        public ManualResetEventSlim ContinueSecond { get; } = new(false);
+
+        public ManualResetEventSlim AddedSecond { get; } = new(false);
+
+        public ManualResetEventSlim Release { get; } = new(false);
+
+        public bool TryRun(ScanRequest request, ScanCollector collector, out string? failureReason)
+        {
+            failureReason = null;
+            request.CancellationToken.ThrowIfCancellationRequested();
+
+            Assert.True(collector.TryAdd("first.txt", NodeKind.File, 10, 10, null));
+            Entered.Set();
+
+            ContinueSecond.Wait(System.Threading.Timeout.InfiniteTimeSpan, request.CancellationToken);
+            request.CancellationToken.ThrowIfCancellationRequested();
+
+            Assert.True(collector.TryAdd("second.txt", NodeKind.File, 20, 20, null));
+            AddedSecond.Set();
+
+            Release.Wait(System.Threading.Timeout.InfiniteTimeSpan, request.CancellationToken);
+            request.CancellationToken.ThrowIfCancellationRequested();
+            return true;
         }
     }
 }

@@ -34,7 +34,19 @@ internal sealed class ScanCollector
     private readonly long _memoryLimit;
     private readonly int _rootPathLength;
 
+    /// <summary>
+    /// Incremental directory tree for attached (production) scans: folder names stored once,
+    /// files keep basename plus parent linkage, immutable file nodes created once and shared
+    /// by every preview and the final tree. Unused until <see cref="AttachIds"/> is called.
+    /// </summary>
+    private readonly ManagedScanTree _tree = new();
+
+    /// <summary>
+    /// Flat entry list for direct (test/small) use without attached ids. Preserves exact
+    /// legacy semantics including duplicate emissions; production scans never fill this.
+    /// </summary>
     private readonly List<ScanEntry> _entries = [];
+    private ScanIdMap? _ids;
     private readonly List<ScanDiagnostic> _diagnostics = [];
 
     private long _files;
@@ -63,13 +75,34 @@ internal sealed class ScanCollector
         _rootPathLength = rootPathLength;
     }
 
+    /// <summary>
+    /// Attaches the scan's identity map, switching this collector to the incremental tree
+    /// path: file/folder ids are reserved at add time and file nodes are created once and
+    /// shared by every preview and the final tree. Called once by FileSystemScanner after
+    /// BeginBuild, before any backend runs (the tree is empty then). Collectors used
+    /// directly by tests never attach and keep exact legacy list semantics.
+    /// </summary>
+    public void AttachIds(ScanIdMap ids)
+    {
+        lock (_gate)
+        {
+            _ids = ids;
+        }
+    }
+
+    /// <summary>
+    /// Below-root entries. Without attached ids this is the legacy flat list (duplicates
+    /// preserved); with ids it is reconstructed from the tree for small-tree and test use.
+    /// Production builds never call this for large volumes; they freeze the tree directly
+    /// so no full-path-per-file copy is ever materialised.
+    /// </summary>
     public IReadOnlyList<ScanEntry> Entries
     {
         get
         {
             lock (_gate)
             {
-                return _entries.ToArray();
+                return _ids is null ? _entries.ToArray() : [.. _tree.EnumerateEntries()];
             }
         }
     }
@@ -247,13 +280,17 @@ internal sealed class ScanCollector
     /// True for the second and later names a hard-linked file appears under, so
     /// <see cref="HardLinkedFileCount"/> is the number of extra nodes rather than of files.
     /// </remarks>
-    public bool TryAdd(
+    /// <summary>
+    /// Legacy flat-list append for unattached collectors. Byte-for-byte the old behaviour:
+    /// one shared-budget unit plus the legacy path estimate per emission, duplicates kept.
+    /// </summary>
+    private bool TryAddLegacy(
         string relativePath,
         NodeKind kind,
         long logicalSize,
         long physicalSize,
         DateTimeOffset? lastWriteTime,
-        bool isExtraHardLinkEntry = false)
+        bool isExtraHardLinkEntry)
     {
         lock (_gate)
         {
@@ -277,6 +314,120 @@ internal sealed class ScanCollector
                 return true;
             }
 
+            _files++;
+            _logicalBytes = SaturatingAdd(_logicalBytes, logicalSize);
+            _physicalBytes = SaturatingAdd(_physicalBytes, physicalSize);
+            _representedBytes = SaturatingAdd(_representedBytes, physicalSize > 0 ? physicalSize : logicalSize);
+
+            if (isExtraHardLinkEntry)
+            {
+                _hardLinkedFiles++;
+            }
+
+            return true;
+        }
+    }
+
+    public bool TryAdd(
+        string relativePath,
+        NodeKind kind,
+        long logicalSize,
+        long physicalSize,
+        DateTimeOffset? lastWriteTime,
+        bool isExtraHardLinkEntry = false)
+    {
+        ArgumentNullException.ThrowIfNull(relativePath);
+
+        // Unattached collectors (direct unit-test and NTFS-seam use) keep exact legacy list
+        // semantics: every accepted emission is appended, duplicates included, charged with
+        // the legacy estimate. Attached production scans use the incremental tree below.
+        // The attach happens-before any backend task starts, so this lock-free read is safe.
+        if (_ids is null)
+        {
+            return TryAddLegacy(relativePath, kind, logicalSize, physicalSize, lastWriteTime, isExtraHardLinkEntry);
+        }
+
+        string[] segments = ManagedScanTree.Split(relativePath);
+        if (segments.Length == 0)
+        {
+            return true;
+        }
+
+        bool leafIsFolder = kind == NodeKind.Folder;
+        string leafName = segments[^1];
+
+        lock (_gate)
+        {
+            // Honest charging: the leaf plus only the parent folders this entry actually
+            // creates. Siblings sharing parents pay for the leaf alone; inferred parents
+            // are never recharged. A folder leaf already recorded (inferred or explicit)
+            // costs no second retained folder - the budget unit is still claimed so the
+            // MaxEntries count matches the legacy flat list, but no new folder bytes.
+            // Folder entries also carry transient absolute-path workspace while the
+            // portable queue holds them; duplicates from scripted order have none.
+            long parentCost = 0;
+            foreach (int missingLength in _tree.MissingFolderLengths(segments))
+            {
+                parentCost += ScanMemoryBudget.EstimateFolder(missingLength);
+            }
+
+            long cost;
+            if (leafIsFolder)
+            {
+                var peek = _tree.TryFindParent(segments);
+                bool exists = peek.Found && !peek.Blocked && peek.Parent is not null
+                    && ManagedScanTree.HasFolderLeaf(peek.Parent, leafName);
+                cost = parentCost + (exists ? 0 : ScanMemoryBudget.EstimateFolder(leafName.Length) + (2L * _rootPathLength));
+            }
+            else
+            {
+                cost = parentCost + ScanMemoryBudget.EstimateFile(leafName.Length);
+            }
+
+            if (!ClaimLocked(cost))
+            {
+                return false;
+            }
+
+            var (parent, _, _, blocked) = _tree.EnsureParents(segments, _ids);
+            if (blocked)
+            {
+                // A file already owns an intermediate segment of this path (impossible on a
+                // real filesystem: the portable backend emits a parent before its children
+                // and never walks under a file, so this is scripted-order only). The
+                // existing file wins, matching ScanTreeBuilder.Materialise which drops
+                // children of file nodes - except the legacy builder keeps them on the
+                // mutable node and would resurrect them if a later folder entry flips the
+                // leaf kind, while this tree drops blocked descendants permanently. No
+                // reconciliation: the counters below preserve legacy per-emission counts,
+                // but the tree never nests under a file.
+                if (!leafIsFolder)
+                {
+                    _files++;
+                    _logicalBytes = SaturatingAdd(_logicalBytes, logicalSize);
+                    _physicalBytes = SaturatingAdd(_physicalBytes, physicalSize);
+                    _representedBytes = SaturatingAdd(_representedBytes, physicalSize > 0 ? physicalSize : logicalSize);
+                    if (isExtraHardLinkEntry)
+                    {
+                        _hardLinkedFiles++;
+                    }
+                }
+                else
+                {
+                    _directories++;
+                }
+
+                return true;
+            }
+
+            if (leafIsFolder)
+            {
+                _tree.AddFolderLeaf(parent, leafName, lastWriteTime, _ids, out _);
+                _directories++;
+                return true;
+            }
+
+            _tree.AddFile(parent, leafName, logicalSize, physicalSize, lastWriteTime, _ids);
             _files++;
             _logicalBytes = SaturatingAdd(_logicalBytes, logicalSize);
             _physicalBytes = SaturatingAdd(_physicalBytes, physicalSize);
@@ -385,7 +536,7 @@ internal sealed class ScanCollector
             }
 
             _nextReportAt = now + (long)_options.ProgressInterval.TotalMilliseconds;
-            entries = _entries.Count;
+            entries = _ids is null ? _entries.Count : checked((int)Math.Min(int.MaxValue, _files + _directories));
             logical = _logicalBytes;
             represented = _representedBytes;
             activeBackend = _activeBackend;
@@ -443,15 +594,39 @@ internal sealed class ScanCollector
     /// <summary>
     /// One consistent picture for a preview build: the entries copied under the gate
     /// together with the represented total for exactly those entries, so a preview never
-    /// mixes a newer total with an older entry list.
+    /// mixes a newer total with an older entry list. Legacy path for small trees and tests;
+    /// production previews freeze the tree directly via <see cref="CaptureTreeSnapshot"/>.
     /// </summary>
     public (ScanEntry[] Entries, long RepresentedBytes) CapturePreview()
     {
         lock (_gate)
         {
-            return (_entries.ToArray(), _representedBytes);
+            return (_ids is null ? _entries.ToArray() : [.. _tree.EnumerateEntries()], _representedBytes);
         }
     }
+
+    /// <summary>
+    /// Consistent tree picture for a preview or final build: folder structure shallow-copied
+    /// under the gate with the represented total for exactly those entries. File nodes are
+    /// shared references, never cloned. Each capture still allocates one reference array
+    /// per folder plus the frozen child arrays of the built immutable nodes (O(files)
+    /// references transient per preview); old and current published snapshots overlap.
+    /// </summary>
+    public (ManagedScanTree.FolderSnapshot Tree, long RepresentedBytes) CaptureTreeSnapshot()
+    {
+        lock (_gate)
+        {
+            return (ManagedScanTree.FolderSnapshot.Copy(_tree.Root), _representedBytes);
+        }
+    }
+
+    /// <summary>
+    /// Builds the immutable tree from a captured snapshot outside the gate. Folder nodes are
+    /// new per capture; file nodes are the shared instances created at add time.
+    /// </summary>
+    public static TreemapNode BuildFromSnapshot(
+        string rootPath, ManagedScanTree.FolderSnapshot snap, CancellationToken cancellationToken)
+        => ManagedScanTree.BuildRoot(rootPath, snap, cancellationToken);
 
     /// <summary>
     /// How many entries are held, without copying them. The preview loop reads this
@@ -463,8 +638,40 @@ internal sealed class ScanCollector
         {
             lock (_gate)
             {
-                return _entries.Count;
+                return _ids is null
+                    ? _entries.Count
+                    : checked((int)Math.Min(int.MaxValue, _files + _directories));
             }
+        }
+    }
+
+    /// <summary>Files plus explicitly recorded folders, without copying. Preview change detection.</summary>
+    public long TotalEntryCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _files + _directories;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Final-only destructive freeze: builds the immutable root directly from the
+    /// mutable working tree while releasing dictionaries as each folder is copied.
+    /// Avoids the transient full <see cref="ManagedScanTree.FolderSnapshot"/> copy the
+    /// preview path uses. Shared file nodes move by reference; counters, diagnostics
+    /// and pending ids are untouched. The working tree is empty afterwards. Call once
+    /// on the scanning thread after backends joined and previews drained.
+    /// A final-build OutOfMemoryException propagates to the caller; it is never
+    /// treated as a paused preview.
+    /// </summary>
+    public TreemapNode BuildFinalTreeDestructive(string rootPath, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return _tree.BuildFinalDestructive(rootPath, cancellationToken);
         }
     }
 
@@ -473,6 +680,7 @@ internal sealed class ScanCollector
     {
         lock (_gate)
         {
+            _tree.Clear();
             _entries.Clear();
             _entries.TrimExcess();
             _diagnostics.Clear();
@@ -543,7 +751,8 @@ internal sealed class ScanCollector
         _memoryLimitReached = true;
         _complete = false;
         // Resource truncation must remain visible even after an access diagnostic.
-        _incompleteReason = $"Stopped after {_entries.Count:N0} entries to stay within the scan memory budget. Scan a smaller folder for more detail";
+        long held = _ids is null ? _entries.Count : _files + _directories;
+        _incompleteReason = $"Stopped after {held:N0} entries to stay within the scan memory budget. Scan a smaller folder for more detail";
     }
 
     private void MarkIncompleteLocked(string reason)

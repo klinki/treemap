@@ -19,7 +19,7 @@ public sealed record ScanOptions
     public const int MaxDepthHardLimit = 256;
 
     /// <summary>Default shared budget for entries and diagnostics. See <see cref="MaxEntries"/>.</summary>
-    public const long DefaultMaxEntries = 500_000;
+    public const long DefaultMaxEntries = long.MaxValue;
 
     /// <summary>Default cap on retained <see cref="ScanDiagnostic"/> values.</summary>
     public const int DefaultMaxDiagnostics = 200;
@@ -49,17 +49,18 @@ public sealed record ScanOptions
 
     /// <summary>
     /// Shared budget for everything the scan discovers: files, directories and recorded
-    /// diagnostics all draw from it. Must be at least 1. This is an entry budget, not a
-    /// measured heap limit; the default simply keeps a walk bounded by count, and a host
-    /// scanning a large volume should raise it deliberately. Reaching the budget is
-    /// reported through <see cref="ScanResult.IsComplete"/>.
+    /// diagnostics all draw from it. Must be at least 1. The default is effectively
+    /// unbounded (<c>long.MaxValue</c>): the memory budget is the real bound for a full
+    /// volume, so a default C: scan never stops at an arbitrary entry count. An explicit
+    /// smaller value still yields an honest partial result through
+    /// <see cref="ScanResult.IsComplete"/>.
     /// </summary>
     public long MaxEntries { get; init; } = DefaultMaxEntries;
 
     /// <summary>
     /// Optional allowance for estimated scan storage and snapshot construction, in bytes.
-    /// Must be positive. Null uses half the managed heap still available when the scan
-    /// starts; the automatic maximum still applies to an explicit value. Long paths and inferred
+    /// Must be positive. Null uses 85% of the managed heap still available
+    /// when the scan starts; the automatic maximum still applies to an explicit value. Long paths and inferred
     /// folders cost more than flat entries. Reaching it returns an incomplete map.
     /// This estimate supplements external process limits; it is not a hard heap cap.
     /// </summary>

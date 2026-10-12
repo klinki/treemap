@@ -53,6 +53,15 @@ internal sealed class ScanIdMap
     /// <summary>Null for a legacy build, otherwise the normalized scoped root.</summary>
     private string? _pendingRoot;
 
+    /// <summary>
+    /// Hierarchical identities for the incremental tree: (parentId, basename) instead of
+    /// whole below-root paths, so no full path string is retained per file. Shares
+    /// <see cref="_nextId"/> with the legacy string maps; both modes commit/abort together.
+    /// Keys hold the basename reference shared with the tree node, never a joined path.
+    /// </summary>
+    private Dictionary<ChildKey, int>? _pendingChildren;
+    private Dictionary<ChildKey, int> _committedChildren = new(ChildKey.Comparer);
+
     // Ids 0 and 1 belong to the root, which is not in the map, so the first reserved id
     // is 2. Numbers are never reused: a path that disappears and comes back is a new
     // node, and reusing its number would let a stale snapshot claim it.
@@ -73,6 +82,14 @@ internal sealed class ScanIdMap
                 : _committedRoot is not null && string.Equals(_committedRoot, root, ScanPath.NameComparison);
             _pending = new Dictionary<string, int>(match ? _committed.Count + 64 : 64, ScanPath.NameComparer);
             _pendingRoot = root;
+            // Scoped builds reserve hierarchical (parentId, basename) ids plus the two
+            // synthetic space ids (string map); legacy builds need no child map. A rescan
+            // peak holds the committed maps plus the growing pending ones (about 2x ids)
+            // until commit replaces them; the memory estimate accounts for both.
+            _pendingChildren = root is null
+                ? null
+                : new Dictionary<ChildKey, int>(
+                    match ? _committedChildren.Count + 64 : 64, ChildKey.Comparer);
         }
     }
 
@@ -88,6 +105,12 @@ internal sealed class ScanIdMap
                 _pending = null;
                 _pendingRoot = null;
             }
+
+            if (_pendingChildren is not null)
+            {
+                _committedChildren = _pendingChildren;
+                _pendingChildren = null;
+            }
         }
     }
 
@@ -101,6 +124,7 @@ internal sealed class ScanIdMap
         {
             _pending = null;
             _pendingRoot = null;
+            _pendingChildren = null;
         }
     }
 
@@ -201,4 +225,126 @@ internal sealed class ScanIdMap
     /// share an id with each other or with a real entry.
     /// </summary>
     public int ReserveUnknownSpaceScoped() => ReserveRelative("\0#unknown-space");
+
+    /// <summary>
+    /// Returns the id bound to (<paramref name="parentId"/>, <paramref name="name"/>) for the
+    /// incremental tree. No joined path is built or retained: siblings share nothing but
+    /// their parent's id. Case follows <see cref="ScanPath.NameComparer"/>, so Windows
+    /// aliases agree and Unix siblings stay distinct. Committed ids are reused only for the
+    /// same scoped root, like <see cref="ReserveRelative(string)"/>.
+    /// The caller must pass the same basename reference it stores on the node so the map
+    /// shares it instead of copying.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">No scoped build is open, or the 32-bit id space is exhausted.</exception>
+    public int ReserveChild(int parentId, string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        ChildKey key = new(parentId, name);
+        lock (_gate)
+        {
+            Dictionary<ChildKey, int>? pending = _pendingChildren;
+            string? pendingRoot = _pendingRoot;
+            if (pending is null || pendingRoot is null)
+            {
+                throw new InvalidOperationException("No scan build is open.");
+            }
+
+            if (pending.TryGetValue(key, out int id))
+            {
+                return id;
+            }
+
+            bool reuse = _committedRoot is not null
+                && string.Equals(_committedRoot, pendingRoot, ScanPath.NameComparison);
+            if (reuse && _committedChildren.TryGetValue(key, out id))
+            {
+                pending[key] = id;
+                return id;
+            }
+
+            if (_nextId >= int.MaxValue)
+            {
+                throw new InvalidOperationException(
+                    "Node id space exhausted. This scanner instance has seen more distinct paths than a 32-bit id can address; create a new FileSystemScanner.");
+            }
+
+            id = (int)_nextId++;
+            pending[key] = id;
+            return id;
+        }
+    }
+
+    /// <summary>
+    /// Forgets every pending reservation strictly below <paramref name="folderId"/>.
+    /// The folder's own (parentId, basename) key stays: a file replacing a folder reuses
+    /// it for the new leaf. Only the pending map is touched, so an aborted scan keeps
+    /// its committed ids. Called when a file entry replaces a subfolder that already
+    /// holds children (contradictory scripted order; real backends never emit it), so a
+    /// path absent from the returned tree gets a fresh id when it returns instead of
+    /// lingering through the commit into one extra accepted rescan.
+    /// Rare path; a linear pass per level is fine.
+    /// </summary>
+    public void ForgetSubtree(int folderId)
+    {
+        lock (_gate)
+        {
+            Dictionary<ChildKey, int>? pending = _pendingChildren;
+            if (pending is null || pending.Count == 0)
+            {
+                return;
+            }
+
+            HashSet<int> condemned = [folderId];
+            bool removed;
+            do
+            {
+                removed = false;
+                List<ChildKey> dead = [];
+                foreach (var entry in pending)
+                {
+                    if (condemned.Contains(entry.Key.ParentId))
+                    {
+                        dead.Add(entry.Key);
+                    }
+                }
+
+                foreach (ChildKey key in dead)
+                {
+                    if (pending.Remove(key, out int childId))
+                    {
+                        condemned.Add(childId);
+                        removed = true;
+                    }
+                }
+            }
+            while (removed);
+        }
+    }
+
+    /// <summary>
+    /// Hierarchical identity key. Equality folds basename case per platform; the parent id
+    /// keeps same-named files in different folders distinct without any path string.
+    /// </summary>
+    private readonly struct ChildKey(int parentId, string name) : IEquatable<ChildKey>
+    {
+        public static readonly IEqualityComparer<ChildKey> Comparer = new ChildKeyComparer();
+
+        public readonly int ParentId = parentId;
+        public readonly string Name = name;
+
+        public bool Equals(ChildKey other)
+            => ParentId == other.ParentId && ScanPath.NameComparer.Equals(Name, other.Name);
+
+        public override bool Equals(object? obj) => obj is ChildKey other && Equals(other);
+
+        public override int GetHashCode()
+            => HashCode.Combine(ParentId, ScanPath.NameComparer.GetHashCode(Name));
+
+        private sealed class ChildKeyComparer : IEqualityComparer<ChildKey>
+        {
+            public bool Equals(ChildKey x, ChildKey y) => x.Equals(y);
+
+            public int GetHashCode(ChildKey obj) => obj.GetHashCode();
+        }
+    }
 }

@@ -2,7 +2,8 @@
 
 ## Status
 
-Fixed after user confirmation of attempt 002 on 2026-10-11.
+Awaiting user confirmation of attempt 003 after local verification on 2026-10-12.
+Reopened on 2026-10-11 after follow-up reports in the same scan flow.
 
 ## Reported symptoms
 
@@ -55,3 +56,18 @@ On 2026-10-11, the user retested the updated window and confirmed: "Yes, the res
 and crash are gone". The reported bug is fixed. The scan still returns an explicit
 partial result at its memory budget, and the NTFS record rejection still causes
 portable fallback. The pending confirmation in the earlier update is resolved.
+
+## Follow-up report
+
+The user supplied a screenshot of C: at basic detail 1. Windows contains an
+Installer header and many file tiles, although detail 1 should show only immediate
+children of the displayed root. The scan stops after 48,590 entries under the memory
+estimate, leaving 673.7 GB unaccounted. The status also shows portable fallback
+following an MFT update-sequence rejection. A full scan is required; stopping early
+is insufficient even though it avoids the previously reported reset and crash.
+
+On 2026-10-12, attempt 003 published all 3,542,813 accessible C: entries with
+maximum frame depth 1, no reset or allocation failure, and 1.52 GB peak job memory.
+Protected paths still produce an honest incomplete result. The full accessible
+walk is no longer truncated by a resource budget. Visible user confirmation is
+pending; the disk-backed rewrite remains on a separate experimental branch.
