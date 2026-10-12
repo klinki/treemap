@@ -22,6 +22,11 @@ The whole job is killed on a job memory event, at 90% of either cap, or at the
 deadline. It fails closed: an unresolvable program or a failed job, completion port, or
 log file throws rather than falling back to an unbounded run.
 
+For the current desktop scan investigation, memory limits are disabled explicitly
+with `-DisableMemoryLimits`. This removes kernel memory caps and inherited .NET
+heap caps while keeping the deadline, process cleanup, and peak measurements.
+`-Visible` shows the app window. The wrapper's default capped mode is unchanged.
+
 ## Restore
 
 Run once, and again after any package change. Bounded like everything else:
@@ -51,7 +56,7 @@ The status reports the backend, fallback reason, progress, and incomplete result
 Launching without a path does not scan automatically.
 
 ```powershell
-& ./tools/Invoke-Bounded.ps1 -Application dotnet -TimeoutSeconds 300 -Arguments 'src/Treemap.Host.WinForms/bin/Release/net10.0-windows/TreemapHost.dll --no-elevation'
+& ./tools/Invoke-Bounded.ps1 -Application 'src/Treemap.Host.WinForms/bin/Release/net10.0-windows/TreemapHost.exe' -DisableMemoryLimits -Visible -TimeoutSeconds 600 -Arguments '--no-elevation'
 ```
 
 Append a quoted directory path to that argument string to scan it after the window
@@ -87,8 +92,9 @@ For whole-volume scans with capacity available, the first preview contains free
 space and the full unaccounted used space before enumeration begins. Discovered
 files replace that residual in later previews. The desktop progress bar reports
 discovered storage as a fraction of used volume bytes, capped at 99% until the scan
-finishes. This estimates storage coverage, not remaining scan time. Folder scans
-and unavailable capacity use indeterminate progress.
+finishes. A whole-number percentage is shown beside the bar. This estimates storage
+coverage, not remaining scan time. Folder scans and unavailable capacity use
+indeterminate progress with an ellipsis in place of a percentage.
 
 With previews enabled, cancellation or failure restores the previous tree and its
 source path after draining any preview in progress. Abandoning an NTFS attempt
@@ -111,16 +117,12 @@ automatic restart; an elevated child started this way does not inherit the bound
 runner's limits.
 
 The default limits are two directory workers, directory depth 256, and 200 retained
-diagnostics. There is no default entry-count limit; callers can set `MaxEntries`.
-Hitting a limit marks the result incomplete. A memory budget estimates file nodes,
-basenames, folders, diagnostics, backend workspace, and snapshot construction. It
-defaults to 85 percent of the managed heap still available at scan start, capped
-at 1.3 GB.
-`ScanOptions.MemoryBudgetBytes` can request a smaller allowance. Discovery stops
-before accepting an entry that exceeds it. It publishes discovered data as an
-explicitly incomplete map, including free and unaccounted space for volume scans.
-This estimate supplements
-the hard process limits above. Hidden and system entries are included unless
+diagnostics. There is no default entry-count or memory limit. Callers can set
+`MaxEntries` or `MemoryBudgetBytes` explicitly. A requested memory budget estimates
+file nodes, basenames, folders, diagnostics, backend workspace, and snapshot
+construction. Discovery stops before accepting an entry that exceeds it and
+publishes an explicitly incomplete map, including volume-space blocks. Hidden
+and system entries are included unless
 `SkipAttributes` requests otherwise. Links retain zero-byte placeholders and are
 never followed; a link selected as the root is rejected.
 
@@ -130,6 +132,11 @@ use compact pages for dense IDs and a dictionary for sparse IDs. Large scans slo
 previews to reduce allocation pressure. If an intermediate preview runs out of
 memory before publication, previews pause and enumeration continues toward the
 final map; final allocation failures still fail the scan.
+
+The current MFT reader falls back when it encounters `$ATTRIBUTE_LIST`, which can
+link metadata stored in additional file records. This is an unsupported reader
+feature, not an indication of disk corruption. See
+[Microsoft's MFT description](https://learn.microsoft.com/en-us/windows/win32/devnotes/master-file-table).
 
 Logical sizes count the unnamed file stream. Every visible hard-link name receives
 its own node and full size, so totals can count shared clusters repeatedly. The
@@ -214,10 +221,10 @@ artifacts/verification/bounded-run.log
 artifacts/verification/bounded-run.log.json
 ```
 
-`artifacts/` is git-ignored. The wrapper also sets `DOTNET_GCHeapHardLimit` for the
-launched process; that is a **managed heap** limit which supplements the kernel caps —
-it is not a machine-wide cap on its own, and memory pressure that is not in managed
-allocations is invisible to it.
+`artifacts/` is git-ignored. In capped mode the wrapper sets `DOTNET_GCHeapHardLimit`
+for the launched process. That managed heap limit supplements the kernel caps.
+`-DisableMemoryLimits` clears .NET heap-limit variables and omits kernel memory
+caps; the result JSON records `MemoryLimitsEnabled: false`.
 
 ## Verification (2026-10-11)
 
@@ -257,9 +264,18 @@ reverse ancestor relationships, the prepared draw order follows the target hiera
 ## Large-scan verification (2026-10-12)
 
 All 610 affected Core, scanner, desktop, and Skia tests passed; six scanner tests
-were skipped. An elevated C: scan enumerated 3,542,813 entries and published the
-final map in 179.1 seconds. Peak job memory was 1.52 GB under the 2 GB app budget.
+were skipped. An elevated minimized diagnostic enumerated 3,542,813 C: entries
+and published the final map in 179.1 seconds. Peak job memory was 1.52 GB under
+the 2 GB app budget.
 Every recorded frame remained at default detail 1. NTFS declined fragmented
 attributes, so the portable fallback completed the accessible inventory; protected
 paths remain reported as unreadable. See
 [attempt 003](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-003.md) for limits and evidence.
+
+The subsequent visible app retest failed with an out-of-memory error. The user
+then requested no memory limits. After that change, a visible, maximized C: scan
+published all 3,543,334 accessible entries in 156.6 seconds, reached 100%, and
+retained detail 1 without a reset. Peak process/job memory was 2.35 GB. Scanner
+321 and desktop 86 tests passed, with six skips. See
+[attempt 004](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-004.md) for the updated
+constraints and evidence; regular-app user confirmation is pending.

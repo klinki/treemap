@@ -1,22 +1,18 @@
 namespace Treemap.Scanning;
 
-/// <summary>Estimated scan storage and construction allowance, supplementing external process limits.</summary>
-/// <remarks>All numbers are estimates, not a hard heap cap: the OS job cap and GC heap still govern.</remarks>
+/// <summary>Estimated scan storage and construction allowance, only when the caller opts in.</summary>
+/// <remarks>No automatic heap-derived bound is applied: the default scan is unbounded and an
+/// explicit <see cref="ScanOptions.MemoryBudgetBytes"/> is honoured exactly. External process
+/// limits still govern.</remarks>
 internal static class ScanMemoryBudget
 {
-    /// <summary>Caps the automatic estimate even when the machine has much more available memory.</summary>
-    public const long MaxAutomaticBytes = 1_300_000_000L;
-
+    /// <summary>
+    /// The scan's memory allowance in bytes: the caller's explicit budget exactly, or
+    /// effectively unlimited (<c>long.MaxValue</c>) when none was given. There is no
+    /// automatic estimate from the GC heap.
+    /// </summary>
     public static long ResolveLimit(ScanOptions options)
-    {
-        long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
-        long remaining = Math.Max(0, available - GC.GetTotalMemory(false));
-        // Reserve managed headroom for overlapping snapshots and construction.
-        // The estimate is measured once; external process and heap limits remain
-        // necessary because collection timing and native allocations vary.
-        long automatic = Math.Min(remaining * 85 / 100, MaxAutomaticBytes);
-        return options.MemoryBudgetBytes is { } configured ? Math.Min(configured, automatic) : automatic;
-    }
+        => options.MemoryBudgetBytes ?? long.MaxValue;
 
     /// <summary>
     /// Retained cost of one file: single shared immutable node (~80), basename

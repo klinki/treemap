@@ -115,3 +115,20 @@ publication rather than accepting an allocation exception as success.
 Evidence: `artifacts/verification/ntfs-map-reset/diagnostic-after.log` and its JSON
 report. This visible run includes native rendering costs, unlike the minimized
 investigation runs.
+
+## Attempt 003 visible failure — 2026-10-12
+
+Round 7's minimized diagnostic published the full accessible C: inventory below
+2 GB, but the user reported that the actual visible app resets to unscanned space.
+The app is still running, so the observed reset is not itself evidence of a hard
+guard termination. Its redirected console log is empty. The host catches scan
+exceptions and the scanner restores the prior source on failure; the exact
+exception and phase must be captured in a visible reproduction. No larger cap
+or disk-backed rewrite is authorized for this repair.
+
+Subsequently the user explicitly requested no memory limits for now, superseding
+the previous 2 GB cap. The user screenshot and status text confirm an allocation
+failure. The NTFS fallback is separate: this reader declines ATTRIBUTE_LIST
+records because it does not follow metadata in extension records. That is a
+reader limitation, not evidence of volume corruption. The disk-backed draft
+remains deferred.

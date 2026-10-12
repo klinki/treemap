@@ -67,6 +67,7 @@ public static class BoundedProcess
     public sealed class Result
     {
         public uint ProcessId, ExitCode;
+        public bool MemoryLimitsEnabled;
         public string StopReason;
         public double ElapsedSeconds, PeakProcessMiB, PeakJobMiB;
     }
@@ -79,20 +80,29 @@ public static class BoundedProcess
         if (handle == IntPtr.Zero || handle == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
         return handle;
     }
-    public static Result Run(string application, string arguments, string directory, string log, int timeoutSeconds, ulong processMiB, ulong jobMiB)
+    public static Result Run(string application, string arguments, string directory, string log, int timeoutSeconds, ulong processMiB, ulong jobMiB, bool disableMemoryLimits = false, bool showWindow = false)
     {
         IntPtr job = IntPtr.Zero, port = IntPtr.Zero, output = IntPtr.Zero, input = IntPtr.Zero;
         ProcessInfo process = new ProcessInfo();
         bool assigned = false;
-        Result result = new Result { StopReason = "completed" };
+        Result result = new Result { StopReason = "completed", MemoryLimitsEnabled = !disableMemoryLimits };
         try
         {
             job = CheckHandle(CreateJobObject(IntPtr.Zero, null));
             ExtendedLimit limits = new ExtendedLimit();
             // Kernel commit caps, kill on close, and no breakaway permission.
-            limits.Basic.Flags = 0x100 | 0x200 | 0x2000;
-            limits.ProcessMemory = new UIntPtr(processMiB * 1024 * 1024);
-            limits.JobMemory = new UIntPtr(jobMiB * 1024 * 1024);
+            // Disabling memory limits leaves only kill-on-close, and the
+            // 90% tripwire plus limit messages must stay disabled below.
+            if (disableMemoryLimits)
+            {
+                limits.Basic.Flags = 0x2000;
+            }
+            else
+            {
+                limits.Basic.Flags = 0x100 | 0x200 | 0x2000;
+                limits.ProcessMemory = new UIntPtr(processMiB * 1024 * 1024);
+                limits.JobMemory = new UIntPtr(jobMiB * 1024 * 1024);
+            }
             Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimit>()));
             port = CheckHandle(CreateIoCompletionPort(new IntPtr(-1), IntPtr.Zero, IntPtr.Zero, 1));
             CompletionPort association = new CompletionPort { Key = new IntPtr(1), Port = port };
@@ -100,8 +110,10 @@ public static class BoundedProcess
             SecurityAttributes security = new SecurityAttributes { Length = Marshal.SizeOf<SecurityAttributes>(), Inherit = 1 };
             output = CheckHandle(CreateFile(log, 0x40000000, 1, ref security, 2, 0x80, IntPtr.Zero));
             input = CheckHandle(CreateFile("NUL", 0x80000000, 1, ref security, 3, 0x80, IntPtr.Zero));
-            StartupInfo startup = new StartupInfo { Size = Marshal.SizeOf<StartupInfo>(), Flags = 0x101, Input = input, Output = output, Error = output };
-            Check(CreateProcess(application, new StringBuilder("\"" + application + "\" " + arguments), IntPtr.Zero, IntPtr.Zero, true, 0x08000004, IntPtr.Zero, directory, ref startup, out process));
+            StartupInfo startup = new StartupInfo { Size = Marshal.SizeOf<StartupInfo>(), Flags = 0x101, ShowWindow = (ushort)(showWindow ? 5 : 0), Input = input, Output = output, Error = output };
+            // Hidden default keeps CREATE_NO_WINDOW; visible GUI needs a window.
+            uint createFlags = showWindow ? 0x00000004u : 0x08000004u;
+            Check(CreateProcess(application, new StringBuilder("\"" + application + "\" " + arguments), IntPtr.Zero, IntPtr.Zero, true, createFlags, IntPtr.Zero, directory, ref startup, out process));
             // Assign while suspended so even its earliest descendants inherit the caps.
             Check(AssignProcessToJobObject(job, process.Process));
             assigned = true;
@@ -117,7 +129,16 @@ public static class BoundedProcess
                 result.PeakProcessMiB = limits.PeakProcessMemory.ToUInt64() / 1048576.0;
                 result.PeakJobMiB = limits.PeakJobMemory.ToUInt64() / 1048576.0;
                 // Also kill at 90% of caps: completion-port limit messages can be dropped.
-                if ((received && (message == 9 || message == 10)) || result.PeakProcessMiB >= processMiB * 0.9 || result.PeakJobMiB >= jobMiB * 0.9)
+                // Disabled caps mean unlimited: skip every memory kill, avoid 0 * 0.9.
+                bool memoryExceeded = false;
+                if (!disableMemoryLimits)
+                {
+                    bool limitMessage = received && (message == 9 || message == 10);
+                    bool processOver = processMiB > 0 && result.PeakProcessMiB >= processMiB * 0.9;
+                    bool jobOver = jobMiB > 0 && result.PeakJobMiB >= jobMiB * 0.9;
+                    memoryExceeded = limitMessage || processOver || jobOver;
+                }
+                if (memoryExceeded)
                     result.StopReason = "memory_limit";
                 else if (clock.Elapsed.TotalSeconds >= timeoutSeconds)
                     result.StopReason = "timeout";

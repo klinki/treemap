@@ -54,13 +54,33 @@ internal sealed class ScanShell : Form
     private readonly Label _statusLabel = new() { AutoSize = true };
     private readonly ProgressBar _progressBar = new()
     {
-        Dock = DockStyle.Top,
+        Dock = DockStyle.Fill,
         Minimum = 0,
         Maximum = 100,
         Value = 0,
         Style = ProgressBarStyle.Continuous,
         MarqueeAnimationSpeed = 30,
-        Height = 12,
+        Margin = new Padding(0, 0, 0, 0),
+    };
+    private readonly Label _percentLabel = new()
+    {
+        Dock = DockStyle.None,
+        Anchor = AnchorStyles.Right,
+        AutoSize = true,
+        Text = "0%",
+        TextAlign = ContentAlignment.MiddleRight,
+        Margin = new Padding(8, 0, 0, 0),
+    };
+    // Size the row to its contents so the percentage fits larger fonts and DPI.
+    private readonly TableLayoutPanel _progressRow = new()
+    {
+        Dock = DockStyle.Top,
+        AutoSize = true,
+        AutoSizeMode = AutoSizeMode.GrowAndShrink,
+        Padding = new Padding(6, 2, 6, 2),
+        ColumnCount = 2,
+        RowCount = 1,
+        GrowStyle = TableLayoutPanelGrowStyle.FixedSize,
     };
 
     private readonly Button _backButton = new() { Text = "Back", AutoSize = true, Enabled = false };
@@ -224,6 +244,12 @@ internal sealed class ScanShell : Form
 
     internal ProgressBar ProgressBarControl => _progressBar;
 
+    internal Label PercentLabel => _percentLabel;
+
+    internal string PercentText => _percentLabel.Text;
+
+    internal Control ProgressRow => _progressRow;
+
     internal Control FilterRow => _filterRow;
 
     internal TextBox FilterBox => _filterBox;
@@ -308,11 +334,16 @@ internal sealed class ScanShell : Form
 
         // Added fill first: WinForms docks from the last child back, so the view is laid
         // out last and takes whatever the panels leave behind. The navigation bar
-        // docks directly beneath the scan toolbar, the full-width progress bar
-        // below those rows, and the filter row below the bar.
+        // docks directly beneath the scan toolbar, the full-width progress row
+        // (bar plus percentage) below those rows, and the filter row below it.
+        _progressRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        _progressRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        _progressRow.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        _progressRow.Controls.Add(_progressBar, 0, 0);
+        _progressRow.Controls.Add(_percentLabel, 1, 0);
         Controls.Add(_view);
         Controls.Add(_filterRow);
-        Controls.Add(_progressBar);
+        Controls.Add(_progressRow);
         Controls.Add(navBar);
         Controls.Add(toolbar);
         Controls.Add(status);
@@ -1000,6 +1031,8 @@ internal sealed class ScanShell : Form
         // ScanProgress.PercentComplete is a nullable 0..99 estimate until
         // Finished reports 100; a non-finished tick claiming 100 is clamped
         // back to 99 so the bar never shows full before the accepted finish.
+        // The percentage label always matches the bar: a whole value while
+        // determinate, an honest placeholder while the estimate is unknown.
         if (tick.PercentComplete.HasValue)
         {
             int percent = Math.Clamp(tick.PercentComplete.Value, 0, 100);
@@ -1010,10 +1043,12 @@ internal sealed class ScanShell : Form
 
             _progressBar.Style = ProgressBarStyle.Continuous;
             _progressBar.Value = percent;
+            _percentLabel.Text = $"{percent}%";
         }
         else
         {
             _progressBar.Style = ProgressBarStyle.Marquee;
+            _percentLabel.Text = "...";
         }
 
         _progressLabel.Text =
@@ -1028,6 +1063,7 @@ internal sealed class ScanShell : Form
     {
         _progressBar.Style = ProgressBarStyle.Continuous;
         _progressBar.Value = 0;
+        _percentLabel.Text = "0%";
         _progressBar.Style = ProgressBarStyle.Marquee;
     }
 
@@ -1036,6 +1072,7 @@ internal sealed class ScanShell : Form
     {
         _progressBar.Style = ProgressBarStyle.Continuous;
         _progressBar.Value = 0;
+        _percentLabel.Text = "0%";
     }
 
     /// <summary>Stops the bar at full. Only an accepted finish comes here.</summary>
@@ -1043,6 +1080,7 @@ internal sealed class ScanShell : Form
     {
         _progressBar.Style = ProgressBarStyle.Continuous;
         _progressBar.Value = 100;
+        _percentLabel.Text = "100%";
     }
 
     /// <summary>

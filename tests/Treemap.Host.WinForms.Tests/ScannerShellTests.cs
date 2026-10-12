@@ -179,6 +179,7 @@ public class ScannerShellTests
         Assert.DoesNotContain("choosing", shell.BackendText, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(string.Empty, shell.ProgressText);
         Assert.Equal(0, shell.ProgressBarControl.Value);
+        Assert.Equal("0%", shell.PercentText);
         Assert.False(shell.IsScanning);
         Assert.True(shell.CanScan);
         Assert.False(shell.CanCancel);

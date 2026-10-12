@@ -2,11 +2,12 @@
 
 ## Current state
 
-`awaiting-user-confirmation`. The bug remains open.
+`awaiting-user-confirmation`. Attempt 004 passed visible local verification;
+the bug remains open until the user confirms it.
 
 ## Active attempt
 
-[Fix attempt 003](fix-attempt-003.md).
+[Fix attempt 004](fix-attempt-004.md).
 
 ## Last updated
 
@@ -89,3 +90,23 @@ User confirmation has now been received for the reported reset and crash.
   are reported honestly. All 610 affected tests passed, with six skips. Attempt
   003 is awaiting user confirmation; the earlier confirmation covered attempt
   002 only.
+
+- 2026-10-12: The user rejected attempt 003 confirmation: "The scan still stops
+  or resets", then clarified "Map reset to unscanned". The successful round 7
+  evidence came from a minimized diagnostic. The actual visible app remains
+  running but has no exception logging, so its precise failure is not yet known.
+  Opened attempt 004 to reproduce with visible rendering under the same 2 GB cap
+  and fix the evidenced failure. The disk experiment remains deferred.
+
+- 2026-10-12: User confirmed the exact failure is out of memory and requested
+  no memory limits for now, superseding the 2 GB cap. Delegated removal of
+  launch-time kernel/GC memory limits, default scanner estimated limits, and
+  addition of a whole-number percentage beside the progress bar. Process
+  deadlines remain; explicit library memory budgets remain opt-in.
+
+- 2026-10-12: Attempt 004 passed 407 affected tests with six skips. Its elevated,
+  maximized, visible C: scan published and displayed all 3,543,334 accessible
+  entries at detail 1 and reached 100% without allocation failure or reset.
+  Scan time was 156.6 seconds and peak process/job memory was 2.35 GB. No memory
+  caps were applied under the user's updated instruction. MFT fallback and
+  protected-path warnings remain. Awaiting a regular-app retest confirmation.

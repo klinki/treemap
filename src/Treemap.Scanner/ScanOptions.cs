@@ -1,14 +1,14 @@
 namespace Treemap.Scanning;
 
 /// <summary>
-/// Knobs for one scan. Every field has a bounded default: the scanner is pointed at a
-/// real filesystem by a long-running desktop process, so an accidental unbounded walk is
-/// a memory incident, not a slow query.
+/// Options for one scan. Worker count, directory depth, and retained diagnostics
+/// have bounded defaults; entry-count and memory budgets are optional.
 /// </summary>
 /// <remarks>
 /// Instances are immutable. <see cref="FileSystemScanner.ScanAsync"/> validates the values
 /// before any I/O and throws <see cref="ArgumentOutOfRangeException"/> for invalid
-/// values. The available heap also limits <see cref="MemoryBudgetBytes"/>.
+/// values. Only an explicit <see cref="MemoryBudgetBytes"/> bounds estimated memory;
+/// the default scan has no heap-derived bound.
 /// </remarks>
 public sealed record ScanOptions
 {
@@ -50,17 +50,16 @@ public sealed record ScanOptions
     /// <summary>
     /// Shared budget for everything the scan discovers: files, directories and recorded
     /// diagnostics all draw from it. Must be at least 1. The default is effectively
-    /// unbounded (<c>long.MaxValue</c>): the memory budget is the real bound for a full
-    /// volume, so a default C: scan never stops at an arbitrary entry count. An explicit
-    /// smaller value still yields an honest partial result through
+    /// unbounded (<c>long.MaxValue</c>), so a default C: scan never stops at an arbitrary
+    /// entry count. An explicit smaller value still yields an honest partial result through
     /// <see cref="ScanResult.IsComplete"/>.
     /// </summary>
     public long MaxEntries { get; init; } = DefaultMaxEntries;
 
     /// <summary>
     /// Optional allowance for estimated scan storage and snapshot construction, in bytes.
-    /// Must be positive. Null uses 85% of the managed heap still available
-    /// when the scan starts; the automatic maximum still applies to an explicit value. Long paths and inferred
+    /// Must be positive. Null means no estimate bound: the scan runs without truncation
+    /// based on the GC heap. An explicit value is honoured exactly. Long paths and inferred
     /// folders cost more than flat entries. Reaching it returns an incomplete map.
     /// This estimate supplements external process limits; it is not a hard heap cap.
     /// </summary>

@@ -13,8 +13,14 @@
     kernel reports a job memory limit, or at the deadline -- whichever comes first.
     The whole job is terminated, not just the root process.
 
+    -DisableMemoryLimits omits kernel process/job memory caps and the memory
+    tripwire, and clears inherited .NET heap caps. The deadline, job ownership,
+    cleanup, and peak measurements still apply. -Visible shows the child window;
+    the default stays hidden.
+
     Fails closed. If the application cannot be resolved, or the job, completion port,
-    or log file cannot be created, this throws. There is no unbounded fallback path.
+    or log file cannot be created, this throws. Job creation failures never fall
+    back to launching outside the job.
 
     The DOTNET_GCHeapHardLimit set here is a managed heap limit. It supplements the
     kernel caps for .NET processes; it is not a machine-wide cap on its own.
@@ -34,7 +40,11 @@ param(
     [string]$LogPath = (Join-Path $PSScriptRoot '../artifacts/verification/bounded-run.log'),
     [ValidateRange(1, 600)][int]$TimeoutSeconds = 120,
     [ValidateRange(128, 2048)][int]$ProcessMemoryMiB = 512,
-    [ValidateRange(128, 2048)][int]$JobMemoryMiB = 1024
+    [ValidateRange(128, 2048)][int]$JobMemoryMiB = 1024,
+    # Opt-in: no kernel process/job caps, no 90% tripwire, no inherited GC heap caps.
+    [switch]$DisableMemoryLimits,
+    # Opt-in: show the child GUI window instead of the hidden default.
+    [switch]$Visible
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,7 +77,7 @@ $resolvedDirectory = (Resolve-Path -LiteralPath $WorkingDirectory).Path
 $resolvedApplication = Resolve-Application -Name $Application
 $resolvedLog = [System.IO.Path]::GetFullPath($LogPath)
 
-if ($JobMemoryMiB -lt $ProcessMemoryMiB) { throw 'Job memory cap must be at least the process cap.' }
+if (-not $DisableMemoryLimits -and $JobMemoryMiB -lt $ProcessMemoryMiB) { throw 'Job memory cap must be at least the process cap.' }
 
 # BoundedProcess.Run opens the log with CreateFile(CREATE_ALWAYS), which fails if the
 # directory does not exist. Create it before starting the process.
@@ -79,18 +89,37 @@ if ($logDirectory) {
 if (-not ('BoundedProcess' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'BoundedProcess.cs') }
 
 $previousHeapLimit = $env:DOTNET_GCHeapHardLimit
+$previousHeapPercent = $env:DOTNET_GCHeapHardLimitPercent
+$previousComPlusLimit = $env:COMPlus_GCHeapHardLimit
+$previousComPlusPercent = $env:COMPlus_GCHeapHardLimitPercent
 $previousNodeReuse = $env:MSBUILDDISABLENODEREUSE
 $previousTelemetry = $env:DOTNET_CLI_TELEMETRY_OPTOUT
 try {
-    # Managed heap ceiling for .NET processes only; supplements the kernel caps.
-    $heapBytes = [long]($ProcessMemoryMiB * 0.75 * 1MB)
-    $env:DOTNET_GCHeapHardLimit = $heapBytes.ToString('X')
+    if ($DisableMemoryLimits) {
+        # Unbounded opt-in: clear any inherited managed heap caps.
+        $env:DOTNET_GCHeapHardLimit = $null
+        $env:DOTNET_GCHeapHardLimitPercent = $null
+        $env:COMPlus_GCHeapHardLimit = $null
+        $env:COMPlus_GCHeapHardLimitPercent = $null
+    }
+    else {
+        # Managed heap ceiling for .NET processes only; supplements the kernel caps.
+        $heapBytes = [long]($ProcessMemoryMiB * 0.75 * 1MB)
+        $env:DOTNET_GCHeapHardLimit = $heapBytes.ToString('X')
+    }
     $env:MSBUILDDISABLENODEREUSE = '1'
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 
-    $result = [BoundedProcess]::Run(
-        $resolvedApplication, $Arguments, $resolvedDirectory, $resolvedLog,
-        $TimeoutSeconds, $ProcessMemoryMiB, $JobMemoryMiB)
+    if ($DisableMemoryLimits) {
+        $result = [BoundedProcess]::Run(
+            $resolvedApplication, $Arguments, $resolvedDirectory, $resolvedLog,
+            $TimeoutSeconds, 0, 0, $true, [bool]$Visible)
+    }
+    else {
+        $result = [BoundedProcess]::Run(
+            $resolvedApplication, $Arguments, $resolvedDirectory, $resolvedLog,
+            $TimeoutSeconds, $ProcessMemoryMiB, $JobMemoryMiB, $false, [bool]$Visible)
+    }
 
     $result | ConvertTo-Json | Set-Content -LiteralPath ($resolvedLog + '.json') -Encoding utf8
     $result
@@ -101,6 +130,9 @@ try {
 }
 finally {
     $env:DOTNET_GCHeapHardLimit = $previousHeapLimit
+    $env:DOTNET_GCHeapHardLimitPercent = $previousHeapPercent
+    $env:COMPlus_GCHeapHardLimit = $previousComPlusLimit
+    $env:COMPlus_GCHeapHardLimitPercent = $previousComPlusPercent
     $env:MSBUILDDISABLENODEREUSE = $previousNodeReuse
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = $previousTelemetry
 }

@@ -2,7 +2,8 @@
 
 ## Status
 
-Awaiting user confirmation of attempt 003 after local verification on 2026-10-12.
+Awaiting user confirmation of attempt 004 after visible local verification on
+2026-10-12. Attempt 003's visible user retest failed.
 Reopened on 2026-10-11 after follow-up reports in the same scan flow.
 
 ## Reported symptoms
@@ -71,3 +72,18 @@ maximum frame depth 1, no reset or allocation failure, and 1.52 GB peak job memo
 Protected paths still produce an honest incomplete result. The full accessible
 walk is no longer truncated by a resource budget. Visible user confirmation is
 pending; the disk-backed rewrite remains on a separate experimental branch.
+
+The user then reported that the updated visible C: app reset to an unscanned map.
+Attempt 003 is not accepted. Its minimized diagnostic success does not establish
+success with visible rendering; attempt 004 investigates that difference under
+the unchanged 2 GB app constraint.
+
+The user then confirmed the status "Scan failed: out of memory. Try a smaller
+folder." They requested no memory limits for now and a whole-number percentage
+beside the progress bar. The no-limit instruction supersedes the earlier 2 GB
+constraint for the next verification run.
+
+Attempt 004 completed a visible, maximized C: scan without memory caps. The final
+map contained all 3,543,334 accessible entries, remained at detail 1, and reached
+100% without resetting. Peak process/job memory was 2.35 GB. The new regular-app
+user retest remains pending.

@@ -165,21 +165,32 @@ public class ScanMemoryBudgetTests
     }
 
     [Fact]
-    public void MeasuredCInventoryFitsTheAutomaticCap()
+    public void DefaultOptionsHaveNoAutomaticMemoryLimit()
     {
-        // Independent streaming count: 2,927,443 files + 615,160 folders at ~27
-        // chars average basename. The retained estimate (plus per-folder queued
-        // absolute-path workspace for a short C:\ root) must fit the automatic
-        // cap, or a full C scan stops on budget before enumeration ends.
-        const long Files = 2_927_443;
-        const long Folders = 615_160;
-        const int AvgName = 27;
-        long total = Files * ScanMemoryBudget.EstimateFile(AvgName)
-            + Folders * ScanMemoryBudget.EstimateFolder(AvgName)
-            + Folders * 2L * 3;
-        Assert.True(
-            total <= ScanMemoryBudget.MaxAutomaticBytes,
-            $"C-scale estimate {total:N0} bytes exceeds the {ScanMemoryBudget.MaxAutomaticBytes:N0} byte automatic cap.");
+        // The user disabled automatic heap-derived limits: without an explicit
+        // budget the scan is unbounded, so GC pressure alone never truncates it.
+        Assert.Equal(long.MaxValue, ScanMemoryBudget.ResolveLimit(ScanOptions.Default));
+        Assert.Equal(long.MaxValue, ScanMemoryBudget.ResolveLimit(TestOptions.Verbose()));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(16_384)]
+    [InlineData(2_000_000_000L)]
+    public void ExplicitMemoryBudgetIsHonouredExactly(long bytes)
+    {
+        ScanOptions options = TestOptions.Verbose() with { MemoryBudgetBytes = bytes };
+        Assert.Equal(bytes, ScanMemoryBudget.ResolveLimit(options));
+    }
+
+    [Fact]
+    public async Task DefaultOptionsDoNotTruncateASmallScan()
+    {
+        using TempTree tree = new(nameof(DefaultOptionsDoNotTruncateASmallScan));
+        ScanResult result = await new FileSystemScanner(Files(), null).ScanAsync(tree.Root, options: TestOptions.Verbose());
+
+        Assert.True(result.IsComplete);
+        Assert.Equal(100, result.FileCount);
     }
 
     [Theory]

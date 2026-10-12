@@ -318,3 +318,13 @@ Evidence is in ignored attempt003-managed-full-c-r7.log and its guard JSON.
 Core 182, scanner 317, desktop 86, and Skia 25 passed (610 total, six scanner
 skips). The disk-backed draft remains separate at experiment/disk-backed-scanner
 commit 19da19a. Attempt 003 is awaiting the user's visible-window confirmation.
+
+### User retest rejected — 2026-10-12
+
+After commit 77ef2db, the actual visible TreemapHost app auto-scanned C: under the
+same 1,907 MiB process/job caps. The user reported "The scan still stops or resets"
+and clarified "Map reset to unscanned". Its console log is empty, and the app
+remains running at approximately 1.44 GB private memory. This is a failed visible
+confirmation. The successful minimized round 7 diagnostic remains evidence for
+that harness only. Attempt 004 will capture the visible failure before proposing
+a further production change.
