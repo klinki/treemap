@@ -2,8 +2,7 @@
 
 ## Current state
 
-`awaiting-user-confirmation`. Attempt 004 passed visible local verification;
-the bug remains open until the user confirms it.
+`fixed`. The user accepted attempt 004 on 2026-10-12.
 
 ## Active attempt
 
@@ -15,7 +14,7 @@ the bug remains open until the user confirms it.
 
 ## Confirmation date
 
-2026-10-11.
+2026-10-12. The earlier 2026-10-11 confirmation applied to attempt 002.
 
 ## Resolution summary
 
@@ -32,6 +31,13 @@ The user confirmed on 2026-10-11 that the reset and crash are gone in the update
 window. This closes the reported map-reset and process-exit bug. Complete C:
 inventory and the NTFS record rejection remain separate limitations.
 
+After the follow-up failures, attempt 004 removed memory caps at the user's
+request and added the percentage label. Visible verification retained the full
+accessible C: map at detail 1 and reached 100%. The user accepted this repair on
+2026-10-12 with "Good, commit your changes." MFT fallback and protected-path
+warnings remain documented limitations; the former 2 GB constraint is not met
+by this uncapped run and was superseded by the user's instruction.
+
 ## Attempt history
 
 - Attempt 001 planned after the C: reproduction narrowed the reset to scan
@@ -44,6 +50,9 @@ inventory and the NTFS record rejection remain separate limitations.
 - Attempt 002 confirmed by the user on 2026-10-11: "Yes, the reset and crash are gone".
 - Attempt 003 opened after the user reported inconsistent detail and failure to
   complete a C: scan. The earlier confirmation applied to the reset and crash only.
+
+- Attempt 004 accepted by the user on 2026-10-12 after the uncapped visible
+  verification and regular-app retest request. Implementation commit: 2a58ded.
 
 ## State change log
 
@@ -67,6 +76,10 @@ inventory and the NTFS record rejection remain separate limitations.
 - 2026-10-11: Reopened for the same scan flow. The user's screenshot shows
   descendants at detail 1 and a memory-limited stop after 48,590 entries. Started
   attempt 003 to enforce consistent depth and allow full enumeration within caps.
+
+- 2026-10-12: User accepted attempt 004 and requested the changes be committed.
+  Marked fixed. Implementation was already committed as 2a58ded; this update
+  records the confirmation without changing code or verification results.
 
 ## Notes
 

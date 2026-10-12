@@ -2,7 +2,7 @@
 
 ## Attempt status
 
-Awaiting user confirmation after visible verification on 2026-10-12.
+Accepted by the user on 2026-10-12. Implementation committed as 2a58ded.
 
 ## Goal
 
@@ -113,13 +113,13 @@ percentages and depth 1. Final publication is still being checked.
 
 The user confirmed that the previous visible reset followed an out-of-memory
 failure. Its precise allocation stack remains unavailable. The new visible scan
-without memory caps published its final map successfully; user confirmation in
-the regular app is pending. MFT extension metadata and protected paths still
+without memory caps published its final map successfully. The user accepted the
+repair on 2026-10-12. MFT extension metadata and protected paths still
 cause honest fallback/access warnings.
 
 ## Next step
 
-Open the regular app without memory caps and request user confirmation.
+Record the user's confirmation and commit the documentation update.
 
 ## Visible full C: verification — 2026-10-12
 
@@ -144,3 +144,10 @@ including System Volume Information, rather than resource truncation. The final
 unaccounted residual was 26,751,734,012 bytes. Evidence is in ignored
 attempt004-visible-full-c.log and its process JSON. Scanner 321 and desktop 86
 passed, with six scanner skips. The regular app retest remains pending.
+
+## User confirmation — 2026-10-12
+
+After the regular app was opened without memory caps and confirmation requested,
+the user replied "Good, commit your changes." The repair is accepted, and the
+pending confirmation above is resolved. No additional code changes or test runs
+are needed for this documentation update.

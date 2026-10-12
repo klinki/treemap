@@ -278,4 +278,4 @@ published all 3,543,334 accessible entries in 156.6 seconds, reached 100%, and
 retained detail 1 without a reset. Peak process/job memory was 2.35 GB. Scanner
 321 and desktop 86 tests passed, with six skips. See
 [attempt 004](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-004.md) for the updated
-constraints and evidence; regular-app user confirmation is pending.
+constraints and evidence. The user accepted the repair on 2026-10-12.

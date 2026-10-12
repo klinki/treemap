@@ -2,8 +2,8 @@
 
 ## Status
 
-Awaiting user confirmation of attempt 004 after visible local verification on
-2026-10-12. Attempt 003's visible user retest failed.
+Fixed after the user accepted attempt 004 on 2026-10-12. Attempt 003's visible
+user retest failed.
 Reopened on 2026-10-11 after follow-up reports in the same scan flow.
 
 ## Reported symptoms
@@ -87,3 +87,9 @@ Attempt 004 completed a visible, maximized C: scan without memory caps. The fina
 map contained all 3,543,334 accessible entries, remained at detail 1, and reached
 100% without resetting. Peak process/job memory was 2.35 GB. The new regular-app
 user retest remains pending.
+
+## Attempt 004 confirmation
+
+On 2026-10-12, the user accepted the updated repair with "Good, commit your
+changes." The implementation is committed as 2a58ded. This resolves the pending
+confirmation above. MFT fallback and protected-path warnings remain documented.
