@@ -5,6 +5,8 @@ animation, and immutable snapshot publication. `Treemap.Scanner` scans real
 directories through portable .NET enumeration or a read-only Windows NTFS MFT
 backend. The desktop host uses WinForms; the scanner library targets portable .NET 10.
 
+This project is heavily inspired by [SpaceSniffer](https://www.uderzo.it/main_products/space_sniffer/).
+
 ## Prerequisites
 
 - Windows — the bounded runner enforces caps through kernel32 job objects.
