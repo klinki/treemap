@@ -90,11 +90,17 @@ entry sets. The desktop enables previews by default.
 
 For whole-volume scans with capacity available, the first preview contains free
 space and the full unaccounted used space before enumeration begins. Discovered
-files replace that residual in later previews. The desktop progress bar reports
-discovered storage as a fraction of used volume bytes, capped at 99% until the scan
-finishes. A whole-number percentage is shown beside the bar. This estimates storage
-coverage, not remaining scan time. Folder scans and unavailable capacity use
-indeterminate progress with an ellipsis in place of a percentage.
+files replace that residual in later previews. The desktop shows a whole-number
+percentage beside the progress bar. Native scans use known MFT traversal across
+two passes: folder indexing contributes 0–50%, and entry reading contributes
+50–99%. During each pass, the status shows the current and total MFT table size
+and an approximate time remaining for that pass. Vacant slots count toward table
+position; extra fragment reads and changing throughput affect the time estimate.
+The scan reaches 100% when its result is accepted.
+
+Portable whole-volume scans estimate discovered storage as a fraction of used
+volume bytes, capped at 99% until completion. Portable folder scans and unavailable
+capacity use indeterminate progress with an ellipsis instead of a percentage.
 
 With previews enabled, cancellation or failure restores the previous tree and its
 source path after draining any preview in progress. Abandoning an NTFS attempt
@@ -289,4 +295,11 @@ with memory limits disabled. One MFT record without a visible name still produce
 an explicit incomplete result; no memory stop, reset, or crash occurred. Scanner
 383 tests and host 86 tests passed, with six scanner platform skips. See
 [attempt 005](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-005.md) for verification
-and remaining warnings. User confirmation of this extension-support change is pending.
+and remaining warnings. The user confirmed native scanning on 2026-10-12.
+
+Native traversal progress passed 496 scanner/host checks (six scanner skips).
+A visible C: run showed advancing indexing percentages before any files were
+emitted, a known 4.15 GB MFT table, and approximate remaining time in both passes.
+It retained the native final map at 100% and detail 1. The existing nameless-record
+warning remained. See [attempt 006](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-006.md)
+for live evidence and the pending confirmation of this progress change.

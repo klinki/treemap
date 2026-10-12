@@ -2,7 +2,7 @@
 
 ## Attempt status
 
-Locally verified on 2026-10-12; awaiting user confirmation of the native scan.
+Confirmed by the user on 2026-10-12; implementation commit 6784813.
 
 ## Goal
 
@@ -98,9 +98,9 @@ regressions. No native success is claimed and the change is not committed.
 
 ## Outcome and next step
 
-Native validation passed for extension-record support. Commit locally, then ask
-the user to confirm the updated regular application. One unnamed-record warning
-remains outside this extension-support repair.
+Native extension-record support is committed as 6784813 and confirmed by the
+user. One unnamed-record warning remains outside this repair. Follow-up parsing
+progress is tracked separately in attempt 006.
 
 ### Contributor round 2 review
 
@@ -192,3 +192,10 @@ Evidence: artifacts/verification/ntfs-map-reset/attempt005-visible-full-c-final.
 and its .log.json runner result. Final source checks:
 attempt005-scanner-final.log (383 passed, six skipped) and
 attempt005-diagnostic-build-final.log (successful rebuild). No benchmark rerun.
+
+### User confirmation
+
+On 2026-10-12, the user answered the native scan confirmation question with
+"Yes, native scanning worked". This confirms attempt 005's extension-record
+repair. Attempt 006's additional indexing progress and time estimate still need
+their own confirmation; memory limits remain disabled.

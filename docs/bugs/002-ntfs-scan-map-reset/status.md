@@ -2,12 +2,13 @@
 
 ## Current state
 
-`awaiting-user-confirmation` for MFT extension-record support. Attempt 004's uncapped scan and
+`awaiting-user-confirmation` for MFT parsing progress. Attempt 005's native
+extension support is confirmed. Attempt 004's uncapped scan and
 percentage repair remains confirmed.
 
 ## Active attempt
 
-[Fix attempt 005](fix-attempt-005.md).
+[Fix attempt 006](fix-attempt-006.md).
 
 ## Last updated
 
@@ -15,7 +16,8 @@ percentage repair remains confirmed.
 
 ## Confirmation date
 
-2026-10-12. The earlier 2026-10-11 confirmation applied to attempt 002.
+2026-10-12 for attempts 004 and 005. Attempt 006 is not yet confirmed.
+The earlier 2026-10-11 confirmation applied to attempt 002.
 
 ## Resolution summary
 
@@ -138,3 +140,16 @@ User confirmation has now been received for the reported reset and crash.
   incomplete warning, with two unreadable-entry diagnostics. No memory stop,
   reset, or crash occurred. Native extension support awaits user confirmation;
   the confirmed attempt 004 repair remains accepted.
+
+- 2026-10-12: The user requested a known-size percentage and parsing-time estimate.
+  Opened attempt 006 to report native traversal progress during indexing and
+  entry reading. Attempt 005 is committed as 6784813 and still awaits explicit
+  confirmation. No imposed memory limits; no disk-backed rewrite.
+
+- 2026-10-12: The user confirmed attempt 005: "Yes, native scanning worked".
+  Native extension-record support is confirmed at commit 6784813.
+- 2026-10-12: Attempt 006 passed all 496 affected checks (six scanner skips).
+  Live C indexing showed advancing percentage before file emission, a known
+  4.15 GB table, and approximate time for each pass. The native final map stayed
+  at 100% and detail 1 without fallback or reset. The nameless-record warning
+  remains documented. Awaiting user confirmation of the new progress behavior.

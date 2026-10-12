@@ -90,10 +90,15 @@ internal sealed class NtfsMftScanBackend : IScanBackend
 
         using (source)
         {
+            collector.SetMftTraversal(MftRecordStream.MftTableBytes(source.Geometry));
+
             NtfsDirectoryMap map = new(request.Options.MaxEntries, collector);
             DirectoryVisitor directories = new(map, source, cancellationToken);
 
-            if (!MftRecordStream.TryWalk(source, cancellationToken, collector, request.RootPath, directories, out failureReason))
+            cancellationToken.ThrowIfCancellationRequested();
+            collector.BeginMftPass(0, ScanPhase.IndexingFolders, request.RootPath);
+
+            if (!MftRecordStream.TryWalk(source, cancellationToken, collector, request.RootPath, directories, out failureReason, ScanPhase.IndexingFolders, 0))
             {
                 return false;
             }
@@ -134,7 +139,9 @@ internal sealed class NtfsMftScanBackend : IScanBackend
 
             EntryVisitor visitor = new(query, map, collector, request, source);
 
-            if (!MftRecordStream.TryWalk(source, cancellationToken, collector, request.RootPath, visitor, out failureReason))
+            collector.BeginMftPass(1, ScanPhase.Enumerating, request.RootPath);
+
+            if (!MftRecordStream.TryWalk(source, cancellationToken, collector, request.RootPath, visitor, out failureReason, ScanPhase.Enumerating, 1))
             {
                 return false;
             }

@@ -74,13 +74,23 @@ internal static class MftRecordStream
     /// table. Returns false with a reason for a source failure or a record that will not
     /// validate.
     /// </summary>
+    /// <remarks>
+    /// The optional <paramref name="phase"/> and <paramref name="passIndex"/> select
+    /// native traversal reporting: a non-negative pass reports MFT table position (which
+    /// includes vacant skipped slots) through <see cref="ScanCollector.ReportMft"/> with a
+    /// combined two-pass percent, so the first pass already moves. The default keeps the
+    /// legacy portable-style <see cref="ScanCollector.Report"/> for fixture and probe
+    /// callers that never started a native pass.
+    /// </remarks>
     public static bool TryWalk(
         IMftRecordSource source,
         CancellationToken cancellationToken,
         ScanCollector collector,
         string currentPath,
         IMftRecordVisitor visitor,
-        out string? failureReason)
+        out string? failureReason,
+        ScanPhase phase = ScanPhase.Enumerating,
+        int passIndex = -1)
     {
         failureReason = null;
 
@@ -89,6 +99,8 @@ internal static class MftRecordStream
         MftRecordInfo record = new();
 
         ulong requested = (ulong)geometry.RecordCount - 1;
+        ulong initial = requested;
+        long total = MftTableBytes(geometry);
         long iteration = 0;
 
         while (requested > 0)
@@ -99,8 +111,17 @@ internal static class MftRecordStream
             {
                 // A large table spends a long time before it reaches the first record the
                 // caller asked for, so the phase is reported from inside the walk rather
-                // than only at its end.
-                collector.Report(ScanPhase.Enumerating, currentPath);
+                // than only at its end. Native passes report table position (vacant gaps
+                // included) so sparse tables cannot stall at zero.
+                if (passIndex >= 0)
+                {
+                    collector.ReportMft(phase, currentPath, MftBytesTraversed(initial, requested, geometry.RecordSize, total));
+                }
+                else
+                {
+                    collector.Report(phase, currentPath);
+                }
+
                 cancellationToken.ThrowIfCancellationRequested();
             }
 
@@ -113,6 +134,13 @@ internal static class MftRecordStream
 
             if (actual == 0)
             {
+                if (passIndex >= 0)
+                {
+                    // Walked off the end of the table: the pass really is complete.
+                    collector.ReportMft(phase, currentPath, total, force: true);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 return true;
             }
 
@@ -153,10 +181,72 @@ internal static class MftRecordStream
             if (record.InUse && !visitor.Visit(record))
             {
                 failureReason = visitor.FailureReason;
+
+                if (failureReason is null && passIndex >= 0)
+                {
+                    // A clean early stop (budget spent): show where the walk stopped,
+                    // never the full pass.
+                    collector.ReportMft(phase, currentPath, MftBytesTraversed(initial, requested, geometry.RecordSize, total), force: true);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 return failureReason is null;
             }
         }
 
+        if (passIndex >= 0)
+        {
+            collector.ReportMft(phase, currentPath, total, force: true);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
         return true;
+    }
+
+    /// <summary>Known table span (<c>RecordCount * RecordSize</c>), saturated, never zero.</summary>
+    internal static long MftTableBytes(MftGeometry geometry)
+    {
+        try
+        {
+            checked
+            {
+                long total = (long)geometry.RecordCount * (long)geometry.RecordSize;
+                return total > 0 ? total : geometry.RecordSize;
+            }
+        }
+        catch (OverflowException)
+        {
+            return long.MaxValue;
+        }
+    }
+
+    /// <summary>
+    /// Bytes traversed from the top of the table down to <paramref name="requested"/> (the
+    /// next ordinal to ask for). Gaps the kernel skipped count, because the cursor moved
+    /// past them; clamped to <paramref name="total"/>.
+    /// </summary>
+    internal static long MftBytesTraversed(ulong initial, ulong requested, uint recordSize, long total)
+    {
+        ulong skipped = initial >= requested ? initial - requested : 0;
+
+        long traversed;
+        try
+        {
+            checked
+            {
+                traversed = (long)skipped * (long)recordSize;
+            }
+        }
+        catch (OverflowException)
+        {
+            return total;
+        }
+
+        if (traversed < 0)
+        {
+            return 0;
+        }
+
+        return traversed > total ? total : traversed;
     }
 }

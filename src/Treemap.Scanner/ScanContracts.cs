@@ -34,6 +34,11 @@ public enum ScanPhase
     Building,
     Publishing,
     Finished,
+    /// <summary>
+    /// First NTFS MFT pass: indexing folders. The second pass keeps <see cref="Enumerating"/>.
+    /// Appended so existing numeric values never change.
+    /// </summary>
+    IndexingFolders,
 }
 
 /// <summary>
@@ -61,9 +66,11 @@ public readonly record struct ScanProgress(
     long BytesScanned)
 {
     /// <summary>
-    /// Discovered-storage estimate for whole-volume scans, 0 to 99 until
-    /// <see cref="ScanPhase.Finished"/> reports 100. Null means unknown: folder scans
-    /// or unavailable capacity. A zero used-byte total reports 0, never null.
+    /// Work progress, 0 to 99 until <see cref="ScanPhase.Finished"/> reports 100.
+    /// Native scans report known MFT table traversal across both passes for any root;
+    /// portable scans report a discovered-storage estimate for whole-volume scans.
+    /// Null means unknown: portable folder scans or unavailable capacity. A zero
+    /// used-byte total reports 0, never null.
     /// </summary>
     public int? PercentComplete { get; init; }
 
@@ -82,6 +89,26 @@ public readonly record struct ScanProgress(
 
     /// <summary>Why <see cref="FallbackFrom"/> was abandoned, once it has been.</summary>
     public string? FallbackReason { get; init; }
+
+    /// <summary>
+    /// Traversal position through the current MFT pass's table span, in bytes. Null when the
+    /// tick is not a native table walk (portable scans, building, publishing, finished).
+    /// The span covers vacant skipped slots too, so it is traversal work rather than I/O
+    /// bytes or emitted file bytes.
+    /// </summary>
+    public long? MftBytesScanned { get; init; }
+
+    /// <summary>
+    /// Known MFT table span for the current pass, in bytes (<c>RecordCount * RecordSize</c>).
+    /// Null when unknown or not a native table walk.
+    /// </summary>
+    public long? MftTotalBytes { get; init; }
+
+    /// <summary>
+    /// Approximate remaining time for the current pass only, not the whole scan. Null until
+    /// enough of the pass has been observed, and never set for finalization phases.
+    /// </summary>
+    public TimeSpan? EstimatedRemainingTime { get; init; }
 }
 
 /// <summary>One bounded, human-readable note about something the scan could not do exactly.</summary>

@@ -34,6 +34,9 @@ internal sealed class ScanCollector
     private readonly long _memoryLimit;
     private readonly int _rootPathLength;
 
+    /// <summary>Native table walks: folders first, entries second. The bar spans both.</summary>
+    internal const int MftPassCount = 2;
+
     /// <summary>
     /// Incremental directory tree for attached (production) scans: folder names stored once,
     /// files keep basename plus parent linkage, immutable file nodes created once and shared
@@ -63,6 +66,10 @@ internal sealed class ScanCollector
     private ScanBackend? _activeBackend;
     private ScanBackend? _fallbackFrom;
     private string? _fallbackReason;
+    private long? _mftTotalBytes;
+    private int _mftPassIndex = -1;
+    private long _mftBytesScanned;
+    private long _mftPassStartMs;
     private string? _incompleteReason;
     private bool _allocationUnavailable;
     private bool _complete = true;
@@ -217,6 +224,165 @@ internal sealed class ScanCollector
             _activeBackend = activeBackend;
             _fallbackFrom = fallbackFrom;
             _fallbackReason = fallbackReason;
+
+            // A portable retry must never show stale table position or ETA: the table
+            // walk is over and the byte basis is different.
+            if (fallbackFrom.HasValue || activeBackend != ScanBackend.NtfsMft)
+            {
+                ClearMftLocked();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Known MFT table span for the current scan, in bytes. Set once per native run before
+    /// either pass; a non-positive total clears back to unknown. Caller holds no gate;
+    /// the gate is taken here.
+    /// </summary>
+    public void SetMftTraversal(long totalBytes)
+    {
+        lock (_gate)
+        {
+            _mftTotalBytes = totalBytes > 0 ? totalBytes : null;
+            _mftPassIndex = -1;
+            _mftBytesScanned = 0;
+        }
+    }
+
+    /// <summary>
+    /// Starts one native pass (0 for folders, 1 for entries) and forces a boundary tick at
+    /// zero so the bar never sits still while the table moves. Resets the pass clock, so the
+    /// remaining-time estimate restarts for the new pass.
+    /// </summary>
+    public void BeginMftPass(int passIndex, ScanPhase phase, string? currentPath)
+    {
+        if (passIndex < 0 || passIndex >= MftPassCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(passIndex), passIndex, $"Must be between 0 and {MftPassCount - 1}.");
+        }
+
+        lock (_gate)
+        {
+            if (_mftTotalBytes is null)
+            {
+                return;
+            }
+
+            _mftPassIndex = passIndex;
+            _mftBytesScanned = 0;
+            _mftPassStartMs = _clock.ElapsedMilliseconds;
+        }
+
+        ReportMft(phase, currentPath, 0, force: true);
+    }
+
+    /// <summary>Throttled native progress for the current pass, reported outside the gate.</summary>
+    public void ReportMft(ScanPhase phase, string? currentPath, long bytesScanned, bool force = false)
+    {
+        IProgress<ScanProgress>? progress = _progress;
+        if (progress is null)
+        {
+            lock (_gate)
+            {
+                if (_mftTotalBytes is not null && _mftPassIndex >= 0)
+                {
+                    _mftBytesScanned = Math.Clamp(bytesScanned, 0, _mftTotalBytes.Value);
+                }
+            }
+
+            return;
+        }
+
+        long entries;
+        long logical;
+        ScanBackend? activeBackend;
+        ScanBackend? fallbackFrom;
+        string? fallbackReason;
+        long total;
+        long scanned;
+        int passIndex;
+        TimeSpan? remaining;
+
+        lock (_gate)
+        {
+            long now = _clock.ElapsedMilliseconds;
+            if (!force && now < _nextReportAt)
+            {
+                return;
+            }
+
+            if (_mftTotalBytes is null || _mftPassIndex < 0)
+            {
+                return;
+            }
+
+            _nextReportAt = now + (long)_options.ProgressInterval.TotalMilliseconds;
+            entries = _ids is null ? _entries.Count : checked((int)Math.Min(int.MaxValue, _files + _directories));
+            logical = _logicalBytes;
+            activeBackend = _activeBackend;
+            fallbackFrom = _fallbackFrom;
+            fallbackReason = _fallbackReason;
+            total = _mftTotalBytes.Value;
+            passIndex = _mftPassIndex;
+            scanned = Math.Clamp(bytesScanned, 0, total);
+            _mftBytesScanned = scanned;
+
+            double fraction = total <= 0 ? 0 : (double)scanned / (double)total;
+            TimeSpan elapsed = TimeSpan.FromMilliseconds(Math.Max(0, now - _mftPassStartMs));
+            remaining = EstimateMftRemaining(elapsed, fraction);
+        }
+
+        double done = total <= 0
+            ? 0
+            : Math.Clamp((double)scanned / (double)total, 0, 1);
+        int percent = Math.Clamp((int)(((passIndex + done) / MftPassCount) * 100.0), 0, 99);
+
+        ScanProgress tick = new(phase, currentPath, entries, logical)
+        {
+            PercentComplete = percent,
+            ActiveBackend = activeBackend,
+            FallbackFrom = fallbackFrom,
+            FallbackReason = fallbackReason,
+            MftBytesScanned = scanned,
+            MftTotalBytes = total,
+            EstimatedRemainingTime = remaining,
+        };
+
+        progress.Report(tick);
+    }
+
+    /// <summary>
+    /// Approximate remaining time for the current pass from observed throughput. Pure math,
+    /// so tests pass an explicit elapsed rather than sleeping. Null until about a second
+    /// has passed with positive but incomplete progress; null on zero, complete, infinite,
+    /// negative or overflowing inputs.
+    /// </summary>
+    internal static TimeSpan? EstimateMftRemaining(TimeSpan elapsed, double fraction)
+    {
+        if (elapsed < TimeSpan.FromSeconds(1))
+        {
+            return null;
+        }
+
+        if (double.IsNaN(fraction) || double.IsInfinity(fraction) || fraction <= 0 || fraction >= 1)
+        {
+            return null;
+        }
+
+        double seconds = elapsed.TotalSeconds * (1.0 - fraction) / fraction;
+
+        if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0 || seconds > TimeSpan.MaxValue.TotalSeconds)
+        {
+            return null;
+        }
+
+        try
+        {
+            return TimeSpan.FromSeconds(seconds);
+        }
+        catch (OverflowException)
+        {
+            return null;
         }
     }
 
@@ -526,6 +692,10 @@ internal sealed class ScanCollector
         ScanBackend? activeBackend;
         ScanBackend? fallbackFrom;
         string? fallbackReason;
+        bool mftActive;
+        long mftScanned = 0;
+        long mftTotal = 0;
+        int mftPass = -1;
 
         lock (_gate)
         {
@@ -542,6 +712,13 @@ internal sealed class ScanCollector
             activeBackend = _activeBackend;
             fallbackFrom = _fallbackFrom;
             fallbackReason = _fallbackReason;
+            mftActive = _mftTotalBytes.HasValue && _mftPassIndex >= 0;
+            if (mftActive)
+            {
+                mftScanned = _mftBytesScanned;
+                mftTotal = _mftTotalBytes ?? 0;
+                mftPass = _mftPassIndex;
+            }
         }
 
         // Computed outside the gate from the captured count and the cached used
@@ -550,6 +727,30 @@ internal sealed class ScanCollector
         if (phase == ScanPhase.Finished)
         {
             percent = 100;
+        }
+        else if (mftActive && (phase == ScanPhase.Building || phase == ScanPhase.Publishing))
+        {
+            // Traversal is done; hold below completion until the accepted finish.
+            percent = 99;
+        }
+        else if (mftActive && (phase == ScanPhase.IndexingFolders || phase == ScanPhase.Enumerating))
+        {
+            // A direct MFT-phase tick carries its own traversal percent via ReportMft;
+            // this generic path is only a fallback and must not jump back to the
+            // portable estimate. Hold the last native position instead.
+            if (mftTotal <= 0 || mftPass < 0)
+            {
+                percent = 0;
+            }
+            else
+            {
+                double done = Math.Clamp((double)mftScanned / (double)mftTotal, 0, 1);
+                percent = Math.Clamp((int)(((mftPass + done) / MftPassCount) * 100.0), 0, 99);
+            }
+        }
+        else if (mftActive)
+        {
+            percent = 99;
         }
         else
         {
@@ -698,7 +899,15 @@ internal sealed class ScanCollector
             _incompleteReason = null;
             _allocationUnavailable = false;
             _complete = true;
+            ClearMftLocked();
         }
+    }
+
+    private void ClearMftLocked()
+    {
+        _mftTotalBytes = null;
+        _mftPassIndex = -1;
+        _mftBytesScanned = 0;
     }
 
     /// <summary>Claims one unit of the shared budget. Caller holds the gate.</summary>

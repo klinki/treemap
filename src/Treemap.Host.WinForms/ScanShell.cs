@@ -1052,7 +1052,56 @@ internal sealed class ScanShell : Form
         }
 
         _progressLabel.Text =
-            $"{DescribePhase(tick.Phase)} - {tick.EntriesScanned:N0} entries, {FormatSize(tick.BytesScanned)}";
+            $"{DescribePhase(tick.Phase)} - {tick.EntriesScanned:N0} entries, {FormatSize(tick.BytesScanned)}{DescribeMftTraversal(tick)}";
+    }
+
+    /// <summary>
+    /// Native table position for the current pass, with its approximate remaining time.
+    /// Shown only on table-walk ticks that carry it; building, publishing, finished and
+    /// portable ticks carry none, so no stale estimate lingers. The byte span is traversal
+    /// work through the table (vacant slots included), not file bytes or I/O bytes.
+    /// </summary>
+    internal static string DescribeMftTraversal(ScanProgress tick)
+    {
+        if (tick.MftTotalBytes is null || tick.MftBytesScanned is null)
+        {
+            return string.Empty;
+        }
+
+        if (tick.Phase != ScanPhase.IndexingFolders && tick.Phase != ScanPhase.Enumerating)
+        {
+            return string.Empty;
+        }
+
+        long scanned = Math.Clamp(tick.MftBytesScanned.Value, 0, Math.Max(0, tick.MftTotalBytes.Value));
+        string text = $", MFT table {FormatSize(scanned)} of {FormatSize(tick.MftTotalBytes.Value)}";
+
+        if (tick.EstimatedRemainingTime is { } remaining && remaining >= TimeSpan.Zero)
+        {
+            text += $", about {FormatRemaining(remaining)} left in this pass";
+        }
+
+        return text;
+    }
+
+    /// <summary>Coarse remaining time: whole seconds, minutes or hours, never false precision.</summary>
+    internal static string FormatRemaining(TimeSpan remaining)
+    {
+        if (remaining < TimeSpan.FromMinutes(1))
+        {
+            return $"{Math.Max(1, (int)Math.Round(remaining.TotalSeconds, MidpointRounding.AwayFromZero))}s";
+        }
+
+        if (remaining < TimeSpan.FromHours(1))
+        {
+            double minutes = remaining.TotalMinutes;
+            long whole = (long)Math.Round(minutes, MidpointRounding.AwayFromZero);
+            return $"{Math.Max(1, whole)}m";
+        }
+
+        double hours = remaining.TotalHours;
+        long wholeHours = (long)Math.Round(hours, MidpointRounding.AwayFromZero);
+        return $"{Math.Max(1, wholeHours)}h";
     }
 
     /// <summary>
@@ -1220,9 +1269,10 @@ internal sealed class ScanShell : Form
     private static string DescribeBackend(ScanBackend backend)
         => backend == ScanBackend.NtfsMft ? "NTFS MFT" : "portable";
 
-    private static string DescribePhase(ScanPhase phase) => phase switch
+    internal static string DescribePhase(ScanPhase phase) => phase switch
     {
         ScanPhase.Starting => "Starting",
+        ScanPhase.IndexingFolders => "Indexing folders",
         ScanPhase.Enumerating => "Reading files",
         ScanPhase.Building => "Building the tree",
         ScanPhase.Publishing => "Publishing",
