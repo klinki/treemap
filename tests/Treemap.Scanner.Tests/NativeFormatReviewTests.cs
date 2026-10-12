@@ -12,6 +12,7 @@ public class NativeFormatReviewTests
     {
         byte[] bytes = new byte[128];
         Write32(bytes, 40, 4096);
+        Write32(bytes, 44, 4096);
         Write32(bytes, 48, 1024);
         Write64(bytes, 56, 1024 * 100);
         Write32(bytes, 96, 32);

@@ -2,8 +2,8 @@
 
 ## Status
 
-Fixed after the user accepted attempt 004 on 2026-10-12. Attempt 003's visible
-user retest failed.
+Open for attempt 005, adding MFT extension-record support. Attempt 004's
+uncapped scan and percentage display remain confirmed.
 Reopened on 2026-10-11 after follow-up reports in the same scan flow.
 
 ## Reported symptoms
@@ -93,3 +93,12 @@ user retest remains pending.
 On 2026-10-12, the user accepted the updated repair with "Good, commit your
 changes." The implementation is committed as 2a58ded. This resolves the pending
 confirmation above. MFT fallback and protected-path warnings remain documented.
+
+## MFT support request — 2026-10-12
+
+The user requested "Fix that, I want it to be supported" for metadata split
+across MFT records. A valid attribute list must not itself force portable
+fallback. Names, hard links, directory relationships, and unnamed-stream sizes
+must include the referenced extension records. Invalid or stale metadata must
+still produce honest diagnostics or fallback. The latest instruction remains
+no imposed memory limits, and the disk-backed experiment remains deferred.

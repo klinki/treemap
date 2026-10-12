@@ -132,3 +132,22 @@ failure. The NTFS fallback is separate: this reader declines ATTRIBUTE_LIST
 records because it does not follow metadata in extension records. That is a
 reader limitation, not evidence of volume corruption. The disk-backed draft
 remains deferred.
+
+## MFT extension support investigation — 2026-10-12
+
+The parser records base ordinals/sequences and HasAttributeList. MftRecordStream
+visits live records using FSCTL_GET_NTFS_FILE_RECORD. The first DirectoryVisitor
+deliberately rejects every attribute list and ignores extension records; entry
+enumeration likewise cannot merge extension metadata. This reproduces immediately
+on C: before native discovery and causes the confirmed portable fallback.
+
+FSCTL_GET_NTFS_FILE_RECORD may return a lower live ordinal than requested, so
+resolving a specific reference must validate the returned ordinal and sequence.
+Nonresident size fields describe the full stream only at lowest VCN zero.
+Attribute-list entries identify records and attribute instances; NTFS metadata
+can place the list itself outside the base record. The implementation must
+handle these cases without dropping links or double-counting continuation sizes.
+
+Primary references: Microsoft's ATTRIBUTE_LIST_ENTRY, ATTRIBUTE_RECORD_HEADER,
+and FSCTL_GET_NTFS_FILE_RECORD documentation. Implementation has been delegated
+to Muse Spark Contributor; root will review and run all verification.

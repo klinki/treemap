@@ -317,8 +317,8 @@ public class NtfsMftScanBackendTests
     }
 
     /// <summary>
-    /// An entry whose attributes are split across fragment records cannot be reported from its
-    /// own record alone. Half of it is worse than none of it.
+    /// An entry whose fragments cannot be followed cannot be reported honestly. Half of
+    /// it is worse than none of it.
     /// </summary>
     [Fact]
     public void AnEntryWithSplitAttributesIsDeclinedRatherThanHalfReported()
@@ -335,9 +335,9 @@ public class NtfsMftScanBackendTests
     }
 
     /// <summary>
-    /// A split entry declines wherever it lives. The fragments are not read, and a link held
-    /// only by a fragment can sit inside the requested range with nothing in the base record
-    /// to say so, so "it is probably outside" is not good enough.
+    /// An unresolvable split entry declines wherever it lives. A link held only by a
+    /// fragment can sit inside the requested range with nothing resolvable to say so,
+    /// so "it is probably outside" is not good enough.
     /// </summary>
     [Fact]
     public void ASplitRecordOutsideTheScanRootStillDeclinesBecauseItsExtensionsMayNameUs()
@@ -408,7 +408,7 @@ public class NtfsMftScanBackendTests
     [Fact]
     public void AFileMayLiveInADirectoryWithAHigherRecordNumber()
     {
-        FixtureRecordSource source = new(new MftGeometry(4096, 1024, 4096));
+        FixtureRecordSource source = new(new MftGeometry(4096, 4096, 1024, 4096));
         source.Add(Root, RootRecord());
         source.Add(80, Directory(80, Root, "sub", RootSequence));
         source.Add(40, File(40, 80, "moved.txt", 4_096, 4_096));
@@ -497,7 +497,7 @@ public class NtfsMftScanBackendTests
     [Fact]
     public void TheDepthLimitKeepsTheFrontierPlaceholderAndMarksTheResultIncomplete()
     {
-        FixtureRecordSource source = new(new MftGeometry(4096, 1024, 4096));
+        FixtureRecordSource source = new(new MftGeometry(4096, 4096, 1024, 4096));
         source.Add(Root, RootRecord());
         source.Add(Subdirectory, Directory(Subdirectory, Root, "sub", RootSequence));
         source.Add(17, Directory(17, Subdirectory, "level1"));
@@ -659,7 +659,7 @@ public class NtfsMftScanBackendTests
     /// <summary>The root, one folder, a folder inside it, and a few files.</summary>
     private static FixtureRecordSource Volume()
     {
-        FixtureRecordSource source = new(new MftGeometry(4096, 1024, 4096));
+        FixtureRecordSource source = new(new MftGeometry(4096, 4096, 1024, 4096));
 
         source.Add(Root, RootRecord());
         source.Add(Subdirectory, Directory(Subdirectory, Root, "sub", RootSequence));

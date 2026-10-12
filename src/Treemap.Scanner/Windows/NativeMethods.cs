@@ -7,9 +7,13 @@ namespace Treemap.Scanning.Windows;
 /// The Win32 entry points the Windows backend needs, and nothing else.
 /// </summary>
 /// <remarks>
-/// Plain <c>DllImport</c> with byte arrays rather than source-generated interop:
-/// the source generator emits unsafe marshalling, and the scanner project does not enable
-/// unsafe code. Buffer sizes are explicit, so nothing here depends on pinning.
+/// Plain <c>DllImport</c> rather than source-generated interop: the source generator
+/// emits unsafe marshalling, and the scanner project does not enable unsafe code.
+/// <c>DeviceIoControl</c> uses buffered I/O so managed arrays are fine there; raw
+/// volume reads use sector-aligned unmanaged buffers (see
+/// <see cref="WindowsMftRecordSource"/>), because volume handles are non-cached even
+/// without <c>FILE_FLAG_NO_BUFFERING</c> and all non-cached I/O requirements apply
+/// (sector-sized offsets, counts and addresses).
 /// </remarks>
 internal static class NativeMethods
 {
@@ -60,6 +64,29 @@ internal static class NativeMethods
         byte[] outBuffer,
         int outBufferSize,
         out uint bytesReturned,
+        nint overlapped);
+
+    /// <summary>Moves the volume file pointer. Reads below use <c>FileBegin</c>.</summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetFilePointerEx(
+        SafeFileHandle file,
+        long distanceToMove,
+        out long newFilePointer,
+        uint moveMethod);
+
+    /// <summary>
+    /// Reads bytes at the current volume pointer into a sector-aligned unmanaged buffer.
+    /// The caller owns the lifetime: the pointer must stay valid for the call and be
+    /// freed afterwards. Read-only; nothing here writes, locks or unmounts.
+    /// </summary>
+    [DllImport("kernel32.dll", EntryPoint = "ReadFile", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ReadFileAligned(
+        SafeFileHandle file,
+        nint buffer,
+        uint bytesToRead,
+        out uint bytesRead,
         nint overlapped);
 
     /// <summary>Formats a Win32 error for a fallback reason.</summary>

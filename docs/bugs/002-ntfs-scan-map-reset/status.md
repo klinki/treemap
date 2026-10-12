@@ -2,11 +2,12 @@
 
 ## Current state
 
-`fixed`. The user accepted attempt 004 on 2026-10-12.
+`awaiting-user-confirmation` for MFT extension-record support. Attempt 004's uncapped scan and
+percentage repair remains confirmed.
 
 ## Active attempt
 
-[Fix attempt 004](fix-attempt-004.md).
+[Fix attempt 005](fix-attempt-005.md).
 
 ## Last updated
 
@@ -123,3 +124,17 @@ User confirmation has now been received for the reported reset and crash.
   Scan time was 156.6 seconds and peak process/job memory was 2.35 GB. No memory
   caps were applied under the user's updated instruction. MFT fallback and
   protected-path warnings remain. Awaiting a regular-app retest confirmation.
+
+- 2026-10-12: User explicitly confirmed "Yes, map and percentage work", further
+  confirming attempt 004. Separately, they requested support for the MFT
+  attribute-list limitation. Reopened this scan-flow record for attempt 005;
+  the uncapped scan repair remains accepted and memory caps remain disabled.
+
+- 2026-10-12: Attempt 005 passed 383 scanner checks with six platform skips;
+  host checks passed 86/86. Elevated visible C: retained 3,544,475 discovered
+  entries on NTFS MFT without fallback, reached 100%, and kept detail 1.
+  Scan time was 180.5 seconds and peak process/job memory was about 2.17 GB;
+  no memory limits were imposed. One nameless MFT record caused an explicit
+  incomplete warning, with two unreadable-entry diagnostics. No memory stop,
+  reset, or crash occurred. Native extension support awaits user confirmation;
+  the confirmed attempt 004 repair remains accepted.

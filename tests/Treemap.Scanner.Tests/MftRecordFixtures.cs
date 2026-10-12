@@ -57,6 +57,11 @@ internal sealed class MftRecordBuilder
     private bool _endMarker = true;
     private byte? _nameNamespaceOverride;
     private byte? _nameLengthOverride;
+    private ushort _nextInstance;
+    private readonly List<(uint type, ulong refOrdinal, ushort refSequence, ushort attributeId, string attributeName, ulong lowestVcn)> _listEntries = [];
+    private byte[]? _listRaw;
+    private (long fileSize, (long lcn, ulong clusters)[] runs)? _listNonResident;
+    private readonly List<(ulong lowestVcn, ulong highestVcn, long? fileSize, (long lcn, ulong clusters)[] runs)> _listNonResidentSegments = [];
 
     /// <summary>Writes a name entry into a namespace that does not exist.</summary>
     public MftRecordBuilder NameNamespace(byte value)
@@ -259,13 +264,15 @@ internal sealed class MftRecordBuilder
     }
 
     /// <summary>A non-resident DATA attribute stating a size past long.MaxValue.</summary>
-    public MftRecordBuilder AddOversizedNonResidentData(ulong fileSize, bool compressed = false)
+    public MftRecordBuilder AddOversizedNonResidentData(ulong fileSize, bool compressed = false, ulong lowestVcn = 0)
     {
         int header = compressed ? ExtendedHeader : NonResidentHeader;
         byte[] value = new byte[header + MappingTerminatorLength];
 
         value[8] = 1;
         BinaryPrimitives.WriteUInt16LittleEndian(value.AsSpan(0x20), (ushort)header);
+        BinaryPrimitives.WriteUInt64LittleEndian(value.AsSpan(16), lowestVcn);
+        BinaryPrimitives.WriteUInt64LittleEndian(value.AsSpan(24), lowestVcn);
         BinaryPrimitives.WriteUInt64LittleEndian(value.AsSpan(40), ulong.MaxValue);
         BinaryPrimitives.WriteUInt64LittleEndian(value.AsSpan(48), fileSize);
         BinaryPrimitives.WriteUInt16LittleEndian(value.AsSpan(12), compressed ? MftRecordParser.AttributeFlagCompressed : (ushort)0);
@@ -278,9 +285,71 @@ internal sealed class MftRecordBuilder
         return AddNonResidentAttribute((uint)MftAttributeType.Data, value);
     }
 
-    /// <summary>Marks the record as one whose attributes do not all fit inside it.</summary>
+    /// <summary>
+    /// Marks the record as split but names a fragment that is not on the volume: a valid
+    /// list entry pointing at record 9999, which the volume answers by returning a lower
+    /// live record. Resolution must decline rather than attach that record's metadata.
+    /// </summary>
     public MftRecordBuilder AddAttributeList()
-        => AddResidentAttribute((uint)MftAttributeType.AttributeList, new byte[40]);
+        => AddAttributeListEntry((uint)MftAttributeType.Data, refOrdinal: 9999, refSequence: 1, attributeId: 0);
+
+    /// <summary>
+    /// Appends one entry to this record's resident attribute list: a valid entry naming
+    /// the attribute segment at (<paramref name="refOrdinal"/>, <paramref name="refSequence"/>).
+    /// Every attribute this builder writes carries instance zero unless
+    /// <see cref="WithAttributeInstance"/> says otherwise, so entries use zero by default.
+    /// </summary>
+    public MftRecordBuilder AddAttributeListEntry(
+        uint type,
+        ulong refOrdinal,
+        ushort refSequence,
+        ushort attributeId,
+        string attributeName = "",
+        ulong lowestVcn = 0)
+    {
+        _listEntries.Add((type, refOrdinal, refSequence, attributeId, attributeName, lowestVcn));
+        return this;
+    }
+
+    /// <summary>A resident list with these exact value bytes: malformed when they are not valid entries.</summary>
+    public MftRecordBuilder AddAttributeListRaw(byte[] value)
+    {
+        _listRaw = value;
+        return this;
+    }
+
+    /// <summary>
+    /// A non-resident attribute list: its value lives in volume clusters. Each run is
+    /// (<paramref name="runs"/> element): an LCN and a cluster count, or LCN -1 for a
+    /// sparse hole. Tests serve the bytes through <see cref="FixtureRecordSource.AddVolumeData"/>.
+    /// </summary>
+    public MftRecordBuilder AddAttributeListNonResident(long fileSize, params (long lcn, ulong clusters)[] runs)
+    {
+        _listNonResident = (fileSize, runs);
+        return this;
+    }
+
+    /// <summary>
+    /// A non-resident list segment covering <paramref name="lowestVcn"/>..<paramref name="highestVcn"/>.
+    /// Only the VCN-zero segment states <paramref name="fileSize"/>; continuations pass null.
+    /// Each run is an LCN and a cluster count, or LCN -1 for a sparse hole.
+    /// </summary>
+    public MftRecordBuilder AddAttributeListNonResidentSegment(
+        ulong lowestVcn,
+        ulong highestVcn,
+        long? fileSize,
+        params (long lcn, ulong clusters)[] runs)
+    {
+        _listNonResidentSegments.Add((lowestVcn, highestVcn, fileSize, runs));
+        return this;
+    }
+
+    /// <summary>The attribute instance the next attribute carries. Fixture attributes default to zero.</summary>
+    public MftRecordBuilder WithAttributeInstance(ushort value)
+    {
+        _nextInstance = value;
+        return this;
+    }
 
     /// <summary>Writes an attribute header declaring a length its body does not have.</summary>
     public MftRecordBuilder AddMalformedAttribute(uint type, uint declaredLength, int actualLength)
@@ -300,6 +369,8 @@ internal sealed class MftRecordBuilder
     /// <summary>Produces the record as the filesystem would store it.</summary>
     public byte[] Build()
     {
+        FlushAttributeList();
+
         int end = (_attributeOffset + 7) & ~7;
 
         if (_endMarker)
@@ -346,6 +417,164 @@ internal sealed class MftRecordBuilder
         return _buffer;
     }
 
+    /// <summary>
+    /// Emits the pending attribute list, if any, as one attribute just before the
+    /// end-of-attributes marker. Resident entries are quadword-aligned, as on-disk lists are.
+    /// </summary>
+    private void FlushAttributeList()
+    {
+        if (_listRaw is not null)
+        {
+            AddResidentAttribute((uint)MftAttributeType.AttributeList, _listRaw);
+            _listRaw = null;
+            return;
+        }
+
+        if (_listEntries.Count > 0)
+        {
+            byte[] value = EncodeListEntries(_listEntries);
+            _listEntries.Clear();
+            AddResidentAttribute((uint)MftAttributeType.AttributeList, value);
+            return;
+        }
+
+        if (_listNonResident is { } nonResident)
+        {
+            byte[] pairs = EncodeMappingPairs(nonResident.runs);
+            int header = 0x40;
+            byte[] attribute = new byte[header + pairs.Length];
+            attribute[8] = 1;
+            BinaryPrimitives.WriteUInt16LittleEndian(attribute.AsSpan(0x0A), 0);
+            BinaryPrimitives.WriteUInt16LittleEndian(attribute.AsSpan(0x0E), 0);
+            BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x10), 0);
+            BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x28), (ulong)nonResident.fileSize);
+            BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x30), (ulong)nonResident.fileSize);
+            BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x38), (ulong)nonResident.fileSize);
+            BinaryPrimitives.WriteUInt16LittleEndian(attribute.AsSpan(0x20), (ushort)header);
+            pairs.CopyTo(attribute, header);
+
+            _listNonResident = null;
+            AddNonResidentAttribute((uint)MftAttributeType.AttributeList, attribute);
+        }
+
+        foreach ((ulong lowestVcn, ulong highestVcn, long? fileSize, (long lcn, ulong clusters)[] runs) in _listNonResidentSegments)
+        {
+            byte[] pairs = EncodeMappingPairs(runs);
+            int header = 0x40;
+            byte[] attribute = new byte[header + pairs.Length];
+            attribute[8] = 1;
+            BinaryPrimitives.WriteUInt16LittleEndian(attribute.AsSpan(0x0A), 0);
+            BinaryPrimitives.WriteUInt16LittleEndian(attribute.AsSpan(0x0E), 0);
+            BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x10), lowestVcn);
+            BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x18), highestVcn);
+            if (fileSize is { } size)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x28), (ulong)size);
+                BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x30), (ulong)size);
+                BinaryPrimitives.WriteUInt64LittleEndian(attribute.AsSpan(0x38), (ulong)size);
+            }
+
+            BinaryPrimitives.WriteUInt16LittleEndian(attribute.AsSpan(0x20), (ushort)header);
+            pairs.CopyTo(attribute, header);
+
+            AddNonResidentAttribute((uint)MftAttributeType.AttributeList, attribute);
+        }
+
+        _listNonResidentSegments.Clear();
+    }
+
+    /// <summary>Encodes list entries exactly as the builder writes them into a record.</summary>
+    internal static byte[] EncodeListEntries(
+        IEnumerable<(uint type, ulong refOrdinal, ushort refSequence, ushort attributeId, string attributeName, ulong lowestVcn)> entries)
+    {
+        List<byte> value = [];
+        foreach ((uint type, ulong refOrdinal, ushort refSequence, ushort attributeId, string attributeName, ulong lowestVcn) in entries)
+        {
+            byte[] name = Encoding.Unicode.GetBytes(attributeName);
+            int recordLength = (26 + name.Length + 7) & ~7;
+            byte[] entry = new byte[recordLength];
+            BinaryPrimitives.WriteUInt32LittleEndian(entry, type);
+            BinaryPrimitives.WriteUInt16LittleEndian(entry.AsSpan(4), (ushort)recordLength);
+            entry[6] = (byte)attributeName.Length;
+            entry[7] = 26;
+            BinaryPrimitives.WriteUInt64LittleEndian(entry.AsSpan(8), lowestVcn);
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                entry.AsSpan(16),
+                (refOrdinal & 0x0000_FFFF_FFFF_FFFFUL) | ((ulong)refSequence << 48));
+            BinaryPrimitives.WriteUInt16LittleEndian(entry.AsSpan(24), attributeId);
+            name.CopyTo(entry, 26);
+            value.AddRange(entry);
+        }
+
+        return [.. value];
+    }
+
+    /// <summary>Encodes runs as mapping pairs: minimal length bytes plus minimal signed offset deltas.</summary>
+    internal static byte[] EncodeMappingPairs((long lcn, ulong clusters)[] runs)
+    {
+        List<byte> pairs = [];
+        long previous = 0;
+
+        foreach ((long lcn, ulong clusters) in runs)
+        {
+            if (lcn < 0)
+            {
+                pairs.Add((byte)LengthSize(clusters));
+                pairs.AddRange(LittleEndian(clusters, LengthSize(clusters)));
+                continue;
+            }
+
+            long delta = lcn - previous;
+            previous = lcn;
+            int offsetSize = SignedSize(delta);
+            int lengthSize = LengthSize(clusters);
+            pairs.Add((byte)((offsetSize << 4) | lengthSize));
+            pairs.AddRange(LittleEndian(clusters, lengthSize));
+            pairs.AddRange(LittleEndian((ulong)delta & (offsetSize == 8 ? ulong.MaxValue : (1UL << (8 * offsetSize)) - 1), offsetSize));
+        }
+
+        pairs.Add(0);
+        return [.. pairs];
+    }
+
+    private static int LengthSize(ulong value)
+    {
+        for (int size = 1; size <= 8; size++)
+        {
+            if (value < (size == 8 ? ulong.MaxValue : 1UL << (8 * size)))
+            {
+                return size;
+            }
+        }
+
+        return 8;
+    }
+
+    private static int SignedSize(long value)
+    {
+        for (int size = 1; size <= 8; size++)
+        {
+            long min = size == 8 ? long.MinValue : -(1L << ((8 * size) - 1));
+            long max = size == 8 ? long.MaxValue : (1L << ((8 * size) - 1)) - 1;
+            if (value >= min && value <= max)
+            {
+                return size;
+            }
+        }
+
+        return 8;
+    }
+
+    private static byte[] LittleEndian(ulong value, int size)
+    {
+        byte[] bytes = new byte[size];
+        for (int i = 0; i < size; i++)
+        {
+            bytes[i] = (byte)(value >> (8 * i));
+        }
+
+        return bytes;
+    }
     /// <summary>
     /// Produces the record as <c>FSCTL_GET_NTFS_FILE_RECORD</c> returns it: the on-disk
     /// bytes with the update sequence already applied, i.e. the saved words written back
@@ -433,6 +662,8 @@ internal sealed class MftRecordBuilder
             name.CopyTo(body, nameOffset);
         }
 
+        BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(0x0E), _nextInstance);
+        _nextInstance = 0;
         BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(16), (uint)value.Length);
         BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(20), (ushort)valueOffset);
         value.CopyTo(body, valueOffset);
@@ -448,6 +679,8 @@ internal sealed class MftRecordBuilder
         value.CopyTo(body, 0);
         BinaryPrimitives.WriteUInt32LittleEndian(body, type);
         BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(4), (uint)length);
+        BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(0x0E), _nextInstance);
+        _nextInstance = 0;
 
         Append(body);
         return this;
@@ -469,6 +702,7 @@ internal sealed class MftRecordBuilder
 internal static class MftGeometryFixtures
 {
     private const int BytesPerSectorOffset = 0x28;
+    private const int BytesPerClusterOffset = 0x2C;
     private const int RecordSizeOffset = 0x30;
     private const int ValidDataLengthOffset = 0x38;
     private const int ExtendedByteCountOffset = 0x60;
@@ -476,8 +710,8 @@ internal static class MftGeometryFixtures
     private const int MinorVersionOffset = 0x66;
 
     /// <summary>
-    /// NTFS 3.1, 4 KiB sectors, 1 KiB MFT records: the ordinary combination, and the one
-    /// that shows a parser reading fixups at the sector size would be wrong.
+    /// NTFS 3.1, 4 KiB sectors and clusters, 1 KiB MFT records: the ordinary combination,
+    /// and the one that shows a parser reading fixups at the sector size would be wrong.
     /// </summary>
     public static byte[] Volume(
         uint recordCount = 4096,
@@ -487,11 +721,17 @@ internal static class MftGeometryFixtures
         int minorVersion = 1,
         long? validDataLength = null,
         int? returnedLength = null,
-        uint? extendedByteCount = null)
+        uint? extendedByteCount = null,
+        uint bytesPerCluster = 4096,
+        long numberSectors = 0,
+        long totalClusters = 0)
     {
         byte[] buffer = new byte[512];
 
+        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(0x08), numberSectors);
+        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(0x10), totalClusters);
         BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(BytesPerSectorOffset), bytesPerSector);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(BytesPerClusterOffset), bytesPerCluster);
         BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(RecordSizeOffset), recordSize);
         BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(ValidDataLengthOffset), validDataLength ?? ((long)recordCount * recordSize));
         BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(ExtendedByteCountOffset), extendedByteCount ?? 8);
@@ -507,9 +747,10 @@ internal static class MftGeometryFixtures
 /// a real volume has: a request for an ordinal answers with the highest registered ordinal at
 /// or below it, and zero once there is none.
 /// </summary>
-internal sealed class FixtureRecordSource : IMftRecordSource
+internal sealed class FixtureRecordSource : IMftRecordSource, IMftVolumeReader
 {
     private readonly List<KeyValuePair<ulong, byte[]>> _records = [];
+    private readonly List<KeyValuePair<long, byte[]>> _volume = [];
 
     public FixtureRecordSource(MftGeometry geometry) => Geometry = geometry;
 
@@ -589,5 +830,53 @@ internal sealed class FixtureRecordSource : IMftRecordSource
 
     public void Dispose()
     {
+    }
+
+    /// <summary>Serves raw volume bytes at <paramref name="byteOffset"/> for non-resident list tests.</summary>
+    public FixtureRecordSource AddVolumeData(long byteOffset, byte[] data)
+    {
+        _volume.Add(new KeyValuePair<long, byte[]>(byteOffset, data));
+        return this;
+    }
+
+    public bool TryReadVolume(long volumeByteOffset, byte[] buffer, int offset, int count, out string? failure)
+    {
+        failure = null;
+
+        if (volumeByteOffset < 0 || offset < 0 || count < 0 || offset + count > buffer.Length)
+        {
+            failure = $"The fixture volume read at byte {volumeByteOffset} for {count} bytes does not fit its buffer.";
+            return false;
+        }
+
+        int done = 0;
+        while (done < count)
+        {
+            long at = volumeByteOffset + done;
+            KeyValuePair<long, byte[]>? hit = null;
+
+            foreach (KeyValuePair<long, byte[]> segment in _volume)
+            {
+                if (at >= segment.Key && at < segment.Key + segment.Value.Length)
+                {
+                    hit = segment;
+                    break;
+                }
+            }
+
+            if (hit is null)
+            {
+                failure = $"The fixture volume holds no bytes at {at}.";
+                return false;
+            }
+
+            int fromSegment = (int)(at - hit.Value.Key);
+            int available = hit.Value.Value.Length - fromSegment;
+            int wanted = Math.Min(available, count - done);
+            Array.Copy(hit.Value.Value, fromSegment, buffer, offset + done, wanted);
+            done += wanted;
+        }
+
+        return true;
     }
 }

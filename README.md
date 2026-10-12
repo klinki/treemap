@@ -133,9 +133,10 @@ previews to reduce allocation pressure. If an intermediate preview runs out of
 memory before publication, previews pause and enumeration continues toward the
 final map; final allocation failures still fail the scan.
 
-The current MFT reader falls back when it encounters `$ATTRIBUTE_LIST`, which can
-link metadata stored in additional file records. This is an unsupported reader
-feature, not an indication of disk corruption. See
+The MFT reader follows resident and nonresident `$ATTRIBUTE_LIST` values to
+resolve metadata in extension records. It validates references and merges only
+the named attributes; continuation data never adds to the file's size. Unsupported
+or inconsistent metadata falls back to portable scanning with a reason. See
 [Microsoft's MFT description](https://learn.microsoft.com/en-us/windows/win32/devnotes/master-file-table).
 
 Logical sizes count the unnamed file stream. Every visible hard-link name receives
@@ -242,8 +243,9 @@ Earlier real-directory checks verified publication, stable IDs, limits, cancella
 and Windows access-denied fallback. See the
 [scanner review evidence](docs/features/filesystem-scanner/verification.md) for details.
 
-The native MFT path passed record fixtures. A live scan through an accessible NTFS
-volume, actual UAC consent, and Linux/macOS runtime checks remain unverified.
+The native MFT path passed record fixtures and an elevated visible C: scan; see
+[attempt 005](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-005.md).
+Linux/macOS runtime checks remain unverified.
 
 Before the scanner change, one BenchmarkDotNet 0.15.8 ShortRun measurement completed
 for `Layout10K`: mean
@@ -279,3 +281,12 @@ retained detail 1 without a reset. Peak process/job memory was 2.35 GB. Scanner
 321 and desktop 86 tests passed, with six skips. See
 [attempt 004](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-004.md) for the updated
 constraints and evidence. The user accepted the repair on 2026-10-12.
+
+With extension-record support, an elevated visible C: scan stayed on NTFS MFT
+without fallback, retained 3,544,475 discovered entries, reached 100%, and kept
+detail 1. Scan time was 180.5 seconds; peak process/job memory was about 2.17 GB,
+with memory limits disabled. One MFT record without a visible name still produced
+an explicit incomplete result; no memory stop, reset, or crash occurred. Scanner
+383 tests and host 86 tests passed, with six scanner platform skips. See
+[attempt 005](docs/bugs/002-ntfs-scan-map-reset/fix-attempt-005.md) for verification
+and remaining warnings. User confirmation of this extension-support change is pending.

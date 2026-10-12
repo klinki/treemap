@@ -10,6 +10,8 @@ namespace Treemap.Scanning.Windows;
 /// The documented <c>NTFS_VOLUME_DATA_BUFFER</c> is 96 bytes, and its extended block starts
 /// at 0x60:
 /// <code>
+/// 0x08  INT64           NumberSectors
+/// 0x10  INT64           TotalClusters
 /// 0x28  UINT32          BytesPerSector
 /// 0x2C  UINT32          BytesPerCluster
 /// 0x30  UINT32          BytesPerFileRecordSegment
@@ -22,7 +24,13 @@ namespace Treemap.Scanning.Windows;
 /// </code>
 /// Reading the version therefore needs 104 bytes of answer.
 /// </remarks>
-internal readonly record struct MftGeometry(uint BytesPerSector, uint RecordSize, long RecordCount)
+internal readonly record struct MftGeometry(
+    uint BytesPerSector,
+    uint BytesPerCluster,
+    uint RecordSize,
+    long RecordCount,
+    long TotalClusters = 0,
+    long NumberSectors = 0)
 {
     /// <summary>
     /// Header in front of the record <c>FSCTL_GET_NTFS_FILE_RECORD</c> returns: the file
@@ -43,11 +51,19 @@ internal readonly record struct MftGeometry(uint BytesPerSector, uint RecordSize
     private const int ExtendedOffset = 0x60;
     private const int ExtendedVersionLength = 8;
 
+    private const int NumberSectorsOffset = 0x08;
+    private const int TotalClustersOffset = 0x10;
     private const int BytesPerSectorOffset = 0x28;
+    private const int BytesPerClusterOffset = 0x2C;
     private const int RecordSizeOffset = 0x30;
     private const int ValidDataLengthOffset = 0x38;
     private const int MajorVersionOffset = 0x64;
     private const int MinorVersionOffset = 0x66;
+
+    /// <summary>
+    /// Largest cluster NTFS documents: 2 MiB (Microsoft's NTFS overview).
+    /// </summary>
+    public const uint MaxClusterSize = 2u * 1024u * 1024u;
 
     /// <summary>
     /// Reads and checks the geometry. A volume that answers with something this backend
@@ -95,6 +111,13 @@ internal readonly record struct MftGeometry(uint BytesPerSector, uint RecordSize
             return false;
         }
 
+        uint clusterSize = BinaryPrimitives.ReadUInt32LittleEndian(buffer[BytesPerClusterOffset..]);
+        if (clusterSize < 512 || clusterSize > MaxClusterSize || (clusterSize & (clusterSize - 1)) != 0 || clusterSize % sectorSize != 0)
+        {
+            failure = $"The volume reports a cluster size of {clusterSize} bytes, which is not a usable multiple of its {sectorSize}-byte sectors.";
+            return false;
+        }
+
         uint recordSize = BinaryPrimitives.ReadUInt32LittleEndian(buffer[RecordSizeOffset..]);
 
         // Deliberately not tested against the sector size: a 4 KiB-sector volume with 1 KiB
@@ -124,9 +147,84 @@ internal readonly record struct MftGeometry(uint BytesPerSector, uint RecordSize
             return false;
         }
 
-        geometry = new MftGeometry(sectorSize, recordSize, recordCount);
+        long numberSectors = BinaryPrimitives.ReadInt64LittleEndian(buffer[NumberSectorsOffset..]);
+        long totalClusters = BinaryPrimitives.ReadInt64LittleEndian(buffer[TotalClustersOffset..]);
+        if (numberSectors < 0 || totalClusters < 0)
+        {
+            failure = "The volume reports a negative sector or cluster count, which this backend cannot use.";
+            return false;
+        }
+
+        // Fixture volumes leave both counts at zero (unknown). A real volume states
+        // both; an overflow or a cluster count that disagrees with the sector count
+        // is a volume this backend cannot bound, so it is declined rather than read
+        // without bounds. A sector tail smaller than one cluster is legitimate.
+        if (numberSectors > 0 || totalClusters > 0)
+        {
+            long sectorBytes;
+            long clusterBytes;
+            try
+            {
+                checked
+                {
+                    sectorBytes = numberSectors * (long)sectorSize;
+                    clusterBytes = totalClusters * (long)clusterSize;
+                }
+            }
+            catch (OverflowException)
+            {
+                failure = "The volume reports a sector or cluster count whose byte size this scanner cannot represent.";
+                return false;
+            }
+
+            if (numberSectors > 0 && totalClusters > 0)
+            {
+                if (clusterBytes > sectorBytes)
+                {
+                    failure = $"The volume reports {totalClusters} clusters of {clusterSize} bytes, larger than its {numberSectors} sectors of {sectorSize} bytes.";
+                    return false;
+                }
+
+                long remainder = sectorBytes - clusterBytes;
+                if (remainder >= (long)clusterSize)
+                {
+                    failure = $"The volume reports {totalClusters} clusters but {numberSectors} sectors leave room for more whole clusters.";
+                    return false;
+                }
+            }
+        }
+
+        geometry = new MftGeometry(sectorSize, clusterSize, recordSize, recordCount, totalClusters, numberSectors);
         failure = null;
         return true;
+    }
+
+    /// <summary>Total volume bytes from clusters when known, otherwise from sectors, otherwise zero.</summary>
+    public long TotalVolumeBytes
+    {
+        get
+        {
+            try
+            {
+                checked
+                {
+                    if (TotalClusters > 0)
+                    {
+                        return TotalClusters * (long)BytesPerCluster;
+                    }
+
+                    if (NumberSectors > 0)
+                    {
+                        return NumberSectors * (long)BytesPerSector;
+                    }
+                }
+            }
+            catch (OverflowException)
+            {
+            }
+
+            return 0;
+        }
     }
 
     /// <summary>The low 48 bits of a file reference number, which is the record number.</summary>

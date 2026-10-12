@@ -74,6 +74,39 @@ internal enum MftRecordRepresentation : byte
     FixupApplied = 1,
 }
 
+/// <summary>One STANDARD_INFORMATION contribution, tied to its attribute identity.</summary>
+/// <param name="Identity">Which attribute stated it.</param>
+/// <param name="AttributeBits">DWORD of file attribute bits.</param>
+/// <param name="LastWriteTime">Modification time, when the value states one.</param>
+internal readonly record struct MftStdContribution(
+    MftAttributeIdentity Identity,
+    uint AttributeBits,
+    DateTimeOffset? LastWriteTime);
+
+/// <summary>One FILE_NAME contribution, tied to its attribute identity.</summary>
+/// <param name="Identity">Which attribute stated it.</param>
+/// <param name="Name">The link this attribute carries.</param>
+/// <param name="AttributeBits">DOS attribute bits from the FILE_NAME value.</param>
+/// <param name="LastWriteTime">Modification time from the FILE_NAME value, as a fallback.</param>
+internal readonly record struct MftFileNameContribution(
+    MftAttributeIdentity Identity,
+    MftName Name,
+    uint AttributeBits,
+    DateTimeOffset? LastWriteTime);
+
+/// <summary>One DATA contribution, tied to its attribute identity.</summary>
+/// <param name="Identity">Which attribute stated it.</param>
+/// <param name="IsResident">True when the content lives inside the record.</param>
+/// <param name="IsUnnamed">True for the unnamed stream that states the file length.</param>
+/// <param name="LogicalSize">File length in bytes.</param>
+/// <param name="AllocatedSize">Allocated bytes.</param>
+internal readonly record struct MftDataContribution(
+    MftAttributeIdentity Identity,
+    bool IsResident,
+    bool IsUnnamed,
+    long LogicalSize,
+    long AllocatedSize);
+
 /// <summary>Everything one MFT record contributed. Reused for every record in a walk.</summary>
 internal sealed class MftRecordInfo
 {
@@ -97,10 +130,31 @@ internal sealed class MftRecordInfo
     /// <summary>True when this record's attributes do not all fit inside it.</summary>
     public bool HasAttributeList { get; set; }
 
+    /// <summary>Entries of resident <c>ATTRIBUTE_LIST</c> values seen in this record.</summary>
+    public List<MftAttributeListEntry> AttributeListEntries { get; } = [];
+
+    /// <summary>Non-resident <c>ATTRIBUTE_LIST</c> segments seen in this record.</summary>
+    public List<MftAttributeListSegment> AttributeListSegments { get; } = [];
+
+    /// <summary>Every attribute identity seen in this record, for list-entry validation.</summary>
+    public List<MftAttributeIdentity> AttributeIdentities { get; } = [];
+
+    /// <summary>Per-identity STANDARD_INFORMATION contributions, for selective merges.</summary>
+    public List<MftStdContribution> StdContributions { get; } = [];
+
+    /// <summary>Per-identity FILE_NAME contributions, for selective merges.</summary>
+    public List<MftFileNameContribution> FileNameContributions { get; } = [];
+
+    /// <summary>Per-identity DATA contributions, for selective merges.</summary>
+    public List<MftDataContribution> DataContributions { get; } = [];
+
     /// <summary>File attributes, folded from every field that states them.</summary>
     public FileAttributes Attributes { get; set; }
 
     public DateTimeOffset? LastWriteTime { get; set; }
+
+    /// <summary>True when <see cref="LastWriteTime"/> came from STANDARD_INFORMATION rather than a FILE_NAME fallback.</summary>
+    public bool LastWriteFromStandardInformation { get; set; }
 
     /// <summary>True when an unnamed <c>DATA</c> attribute supplied a size this backend trusts.</summary>
     public bool HasUnnamedData { get; set; }
@@ -127,8 +181,15 @@ internal sealed class MftRecordInfo
         BaseOrdinal = 0;
         BaseSequence = 0;
         HasAttributeList = false;
+        AttributeListEntries.Clear();
+        AttributeListSegments.Clear();
+        AttributeIdentities.Clear();
+        StdContributions.Clear();
+        FileNameContributions.Clear();
+        DataContributions.Clear();
         Attributes = 0;
         LastWriteTime = null;
+        LastWriteFromStandardInformation = false;
         HasUnnamedData = false;
         DataIsResident = false;
         LogicalSize = 0;
@@ -171,6 +232,7 @@ internal static class MftRecordParser
     public const ulong VolumeRootRecord = 5;
 
     internal const ushort AttributeFlagCompressed = 0x0001;
+    internal const ushort AttributeFlagEncrypted = 0x4000;
     internal const ushort AttributeFlagSparse = 0x8000;
 
     // Record header.
@@ -191,6 +253,7 @@ internal static class MftRecordParser
     private const int AttributeNameLengthField = 0x09;
     private const int AttributeNameOffsetField = 0x0A;
     private const int AttributeFlagsField = 0x0C;
+    private const int AttributeInstanceField = 0x0E;
     private const int ResidentValueLengthField = 0x10;
     private const int ResidentValueOffsetField = 0x14;
 
@@ -211,6 +274,7 @@ internal static class MftRecordParser
     // FILE_NAME value: through the one-byte name length and namespace, then the name.
     private const int FileNameLength = 66;
     private const int FileNameParentField = 0x00;
+    private const int FileNameModifiedField = 0x10;
     private const int FileNameAttributesField = 56;
     private const int FileNameNameLengthField = 64;
     private const int FileNameNamespaceField = 65;
@@ -480,6 +544,7 @@ internal static class MftRecordParser
         bool nonResident = attribute[8] != 0;
         int nameBytes = attribute[AttributeNameLengthField] * 2;
         int nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(attribute[AttributeNameOffsetField..]);
+        ushort instance = BinaryPrimitives.ReadUInt16LittleEndian(attribute[AttributeInstanceField..]);
         int headerLength = nonResident ? NonResidentHeaderLength : ResidentHeaderLength;
 
         if (attribute.Length < headerLength)
@@ -491,6 +556,7 @@ internal static class MftRecordParser
         // An unnamed attribute states no name offset at all, and zero is the ordinary value,
         // so the name is only bounds-checked when there is one. When there is one it is UTF-16
         // that has to sit inside the attribute, past the header.
+        string attributeName = string.Empty;
         if (nameBytes > 0)
         {
             if (nameOffset < headerLength ||
@@ -498,6 +564,16 @@ internal static class MftRecordParser
                 nameBytes > attribute.Length - nameOffset)
             {
                 failure = $"MFT record {ordinal} has an attribute naming itself outside its own length.";
+                return;
+            }
+
+            try
+            {
+                attributeName = Encoding.Unicode.GetString(attribute.Slice(nameOffset, nameBytes));
+            }
+            catch (ArgumentException)
+            {
+                failure = $"MFT record {ordinal} has an attribute whose name is not readable UTF-16.";
                 return;
             }
         }
@@ -528,12 +604,31 @@ internal static class MftRecordParser
                 // A list may live in its own runs. Its references are not readable here,
                 // but its existence means this record's attributes are not all present.
                 info.HasAttributeList = true;
+                info.AttributeIdentities.Add(new MftAttributeIdentity(
+                    type, attributeName, instance, true,
+                    BinaryPrimitives.ReadUInt64LittleEndian(attribute[LowestVcnField..])));
+
+                if (nameBytes == 0)
+                {
+                    CaptureListSegment(attribute, ordinal, info, out failure);
+                }
+
+                return;
             }
 
             if (type == (uint)MftAttributeType.Data && nameBytes == 0)
             {
-                ReadNonResidentData(attribute, ordinal, info, out failure);
+                MftAttributeIdentity dataIdentity = new(
+                    type, attributeName, instance, true,
+                    BinaryPrimitives.ReadUInt64LittleEndian(attribute[LowestVcnField..]));
+                info.AttributeIdentities.Add(dataIdentity);
+                ReadNonResidentData(attribute, ordinal, info, dataIdentity, out failure);
+                return;
             }
+
+            info.AttributeIdentities.Add(new MftAttributeIdentity(
+                type, attributeName, instance, true,
+                BinaryPrimitives.ReadUInt64LittleEndian(attribute[LowestVcnField..])));
 
             return;
         }
@@ -560,6 +655,10 @@ internal static class MftRecordParser
 
         ReadOnlySpan<byte> value = attribute.Slice(valueOffset, (int)valueLength);
 
+        MftAttributeIdentity identity = new(
+            type, attributeName, instance, false, 0);
+        info.AttributeIdentities.Add(identity);
+
         switch ((MftAttributeType)type)
         {
             case MftAttributeType.StandardInformation when nameBytes == 0:
@@ -570,9 +669,17 @@ internal static class MftRecordParser
                 }
 
                 // All four times in both of these attributes are full 64-bit FILETIMEs.
-                info.OrAttributes(BinaryPrimitives.ReadUInt32LittleEndian(value[StandardInformationAttributesField..]));
-                info.LastWriteTime ??= FromWindowsTime(
+                uint stdBits = BinaryPrimitives.ReadUInt32LittleEndian(value[StandardInformationAttributesField..]);
+                DateTimeOffset? stdTime = FromWindowsTime(
                     BinaryPrimitives.ReadUInt64LittleEndian(value[StandardInformationModifiedField..]));
+                info.OrAttributes(stdBits);
+                info.StdContributions.Add(new MftStdContribution(identity, stdBits, stdTime));
+                if (stdTime is not null)
+                {
+                    info.LastWriteTime = stdTime;
+                    info.LastWriteFromStandardInformation = true;
+                }
+
                 break;
 
             case MftAttributeType.FileName when nameBytes == 0:
@@ -582,7 +689,7 @@ internal static class MftRecordParser
                     return;
                 }
 
-                if (!TryReadFileName(value, ordinal, info, out failure))
+                if (!TryReadFileName(value, ordinal, info, identity, out failure))
                 {
                     return;
                 }
@@ -592,7 +699,10 @@ internal static class MftRecordParser
             case MftAttributeType.Data:
                 // Only the unnamed stream is the file's length. A named stream belongs to no
                 // directory entry the user sees, and folding it in would overstate the file.
-                if (nameBytes == 0 && !info.HasUnnamedData)
+                bool isUnnamed = nameBytes == 0;
+                info.DataContributions.Add(new MftDataContribution(
+                    identity, true, isUnnamed, value.Length, 0));
+                if (isUnnamed && !info.HasUnnamedData)
                 {
                     info.HasUnnamedData = true;
                     info.DataIsResident = true;
@@ -606,6 +716,17 @@ internal static class MftRecordParser
 
             case MftAttributeType.AttributeList when nameBytes == 0:
                 info.HasAttributeList = true;
+                if (!MftAttributeList.TryParseEntries(value, ordinal, info.AttributeListEntries, out failure))
+                {
+                    return;
+                }
+
+                break;
+
+            case MftAttributeType.AttributeList:
+                // A named attribute list is not a layout this backend models. Flag it so
+                // the resolver declines honestly rather than half-reporting the file.
+                info.HasAttributeList = true;
                 break;
 
             default:
@@ -616,16 +737,74 @@ internal static class MftRecordParser
     }
 
     /// <summary>
+    /// Keeps one non-resident list segment's runs so the resolver can read its value from
+    /// the volume. Only the segment at VCN zero states the total list length.
+    /// </summary>
+    private static void CaptureListSegment(
+        ReadOnlySpan<byte> attribute,
+        ulong ordinal,
+        MftRecordInfo info,
+        out string? failure)
+    {
+        failure = null;
+
+        ushort flags = BinaryPrimitives.ReadUInt16LittleEndian(attribute[AttributeFlagsField..]);
+        if ((flags & (AttributeFlagCompressed | AttributeFlagEncrypted)) != 0)
+        {
+            failure = $"MFT record {ordinal} has a compressed or encrypted ATTRIBUTE_LIST that this backend will not decode.";
+            return;
+        }
+
+        int mappingPairs = BinaryPrimitives.ReadUInt16LittleEndian(attribute[MappingPairsOffsetField..]);
+        ulong lowestVcn = BinaryPrimitives.ReadUInt64LittleEndian(attribute[LowestVcnField..]);
+        ulong highestVcn = BinaryPrimitives.ReadUInt64LittleEndian(attribute[(LowestVcnField + 8)..]);
+
+        if (highestVcn < lowestVcn)
+        {
+            failure = $"MFT record {ordinal} has an ATTRIBUTE_LIST segment whose highest VCN {highestVcn} is below its lowest {lowestVcn}.";
+            return;
+        }
+
+        // Bounds were checked by the caller; the slice below only copies the runs.
+        MftAttributeListSegment segment = new()
+        {
+            LowestVcn = lowestVcn,
+            HighestVcn = highestVcn,
+            MappingPairs = attribute[mappingPairs..].ToArray(),
+        };
+
+        if (lowestVcn == 0)
+        {
+            if (attribute.Length < DataFileSizeField + 8)
+            {
+                failure = $"MFT record {ordinal} has an ATTRIBUTE_LIST attribute with no list length.";
+                return;
+            }
+
+            segment.FileSize = BinaryPrimitives.ReadUInt64LittleEndian(attribute[DataFileSizeField..]);
+            segment.HasFileSize = true;
+        }
+
+        info.AttributeListSegments.Add(segment);
+    }
+
+    /// <summary>
     /// Reads one link. Every reason to reject it is a reason to reject the record: NTFS cannot
     /// store a separator in a name, so a name that carries one is a damaged record rather
     /// than an entry to quietly leave out.
     /// </summary>
-    private static bool TryReadFileName(ReadOnlySpan<byte> value, ulong ordinal, MftRecordInfo info, out string? failure)
+    private static bool TryReadFileName(
+        ReadOnlySpan<byte> value,
+        ulong ordinal,
+        MftRecordInfo info,
+        MftAttributeIdentity identity,
+        out string? failure)
     {
         // The DOS attribute bits live here rather than in STANDARD_INFORMATION on every
         // filesystem, and SkipAttributes is asked for in those terms, so both sources fold
         // into one answer.
-        info.OrAttributes(BinaryPrimitives.ReadUInt32LittleEndian(value[FileNameAttributesField..]));
+        uint fileBits = BinaryPrimitives.ReadUInt32LittleEndian(value[FileNameAttributesField..]);
+        info.OrAttributes(fileBits);
 
         byte nameNamespace = value[FileNameNamespaceField];
         if (nameNamespace > (byte)MftNameNamespace.Win32AndDos)
@@ -649,11 +828,24 @@ internal static class MftRecordParser
         }
 
         ulong parentReference = BinaryPrimitives.ReadUInt64LittleEndian(value[FileNameParentField..]);
-        info.Names.Add(new MftName(
+        MftName link = new(
             parentReference & ReferenceOrdinalMask,
             (ushort)(parentReference >> 48),
             name,
-            (MftNameNamespace)nameNamespace));
+            (MftNameNamespace)nameNamespace);
+        info.Names.Add(link);
+
+        DateTimeOffset? fileTime = value.Length >= FileNameModifiedField + 8
+            ? FromWindowsTime(BinaryPrimitives.ReadUInt64LittleEndian(value[FileNameModifiedField..]))
+            : null;
+        info.FileNameContributions.Add(new MftFileNameContribution(identity, link, fileBits, fileTime));
+
+        // STANDARD_INFORMATION owns the timestamp when it states one; the FILE_NAME
+        // time is only a fallback for records whose standard information is elsewhere.
+        if (fileTime is not null && info.LastWriteTime is null)
+        {
+            info.LastWriteTime = fileTime;
+        }
 
         failure = null;
         return true;
@@ -687,7 +879,12 @@ internal static class MftRecordParser
         return true;
     }
 
-    private static void ReadNonResidentData(ReadOnlySpan<byte> attribute, ulong ordinal, MftRecordInfo info, out string? failure)
+    private static void ReadNonResidentData(
+        ReadOnlySpan<byte> attribute,
+        ulong ordinal,
+        MftRecordInfo info,
+        MftAttributeIdentity identity,
+        out string? failure)
     {
         failure = null;
 
@@ -695,6 +892,15 @@ internal static class MftRecordParser
         if (mappingPairs < NonResidentHeaderLength || mappingPairs >= attribute.Length)
         {
             failure = $"MFT record {ordinal} has a DATA attribute whose runs fall outside it.";
+            return;
+        }
+
+        // Length fields are only defined on the VCN-zero segment. A continuation
+        // carries whatever bytes its header slot holds (often all-ones), so the
+        // identity is recorded first and sizes are never inspected for one.
+        ulong lowestVcn = BinaryPrimitives.ReadUInt64LittleEndian(attribute[LowestVcnField..]);
+        if (lowestVcn != 0)
+        {
             return;
         }
 
@@ -710,13 +916,6 @@ internal static class MftRecordParser
             return;
         }
 
-        // Only the fragment starting at virtual cluster zero carries the file's real length.
-        // A later fragment must not overwrite it, and a named stream must not contribute.
-        if (BinaryPrimitives.ReadUInt64LittleEndian(attribute[LowestVcnField..]) != 0 || info.HasUnnamedData)
-        {
-            return;
-        }
-
         ulong allocated = BinaryPrimitives.ReadUInt64LittleEndian(attribute[DataAllocatedLengthField..]);
         if (total)
         {
@@ -727,6 +926,16 @@ internal static class MftRecordParser
             !TrySize(allocated, out long allocatedSize, out sizeFailure))
         {
             failure = $"MFT record {ordinal} has a DATA attribute that {sizeFailure}";
+            return;
+        }
+
+        info.DataContributions.Add(new MftDataContribution(identity, false, true, logical, allocatedSize));
+
+        // Only the segment starting at virtual cluster zero carries the file's real
+        // length, and it is kept from the first one seen. A named stream never
+        // reaches here (the caller only forwards the unnamed stream).
+        if (info.HasUnnamedData)
+        {
             return;
         }
 

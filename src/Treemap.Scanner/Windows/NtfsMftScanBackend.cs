@@ -31,7 +31,7 @@ internal delegate bool NtfsSizeQuery(
 /// <para>
 /// Anything that would make the tree confidently wrong declines the backend rather than
 /// producing a partial one: a record that will not validate, a volume whose geometry is not
-/// understood, an entry whose attributes are split across fragment records. Anything narrower
+/// understood, an entry whose split attributes cannot be followed across fragment records. Anything narrower
 /// - a link that was not followed, a file whose size came from an ordinary query - is a
 /// diagnostic on an otherwise good result.
 /// </para>
@@ -91,7 +91,7 @@ internal sealed class NtfsMftScanBackend : IScanBackend
         using (source)
         {
             NtfsDirectoryMap map = new(request.Options.MaxEntries, collector);
-            DirectoryVisitor directories = new(map, cancellationToken);
+            DirectoryVisitor directories = new(map, source, cancellationToken);
 
             if (!MftRecordStream.TryWalk(source, cancellationToken, collector, request.RootPath, directories, out failureReason))
             {
@@ -132,7 +132,7 @@ internal sealed class NtfsMftScanBackend : IScanBackend
                 ?? ((string path, out long logical, out long allocated, out DateTimeOffset? lastWrite)
                     => QueryMetadata(path, request.Options, out logical, out allocated, out lastWrite));
 
-            EntryVisitor visitor = new(query, map, collector, request);
+            EntryVisitor visitor = new(query, map, collector, request, source);
 
             if (!MftRecordStream.TryWalk(source, cancellationToken, collector, request.RootPath, visitor, out failureReason))
             {
@@ -172,7 +172,7 @@ internal sealed class NtfsMftScanBackend : IScanBackend
     }
 
     /// <summary>Pass one: keep the directories, and nothing else.</summary>
-    private sealed class DirectoryVisitor(NtfsDirectoryMap map, CancellationToken cancellationToken) : IMftRecordVisitor
+    private sealed class DirectoryVisitor(NtfsDirectoryMap map, IMftRecordSource source, CancellationToken cancellationToken) : IMftRecordVisitor
     {
         /// <summary>True when the walk stopped because the directory budget ran out.</summary>
         public bool MapFull { get; private set; }
@@ -185,28 +185,46 @@ internal sealed class NtfsMftScanBackend : IScanBackend
 
             // A fragment belongs to the record that names it. It often carries no name of its
             // own, and treating it as a directory would lose a whole folder to a guess.
+            // Fragments are merged into their base below; they are never placed on their own.
             if (record.IsExtension)
             {
                 return true;
             }
 
-            // An entry whose attributes are split across fragment records cannot be reported
-            // from this record alone, and the fragments are not read: a link held only by a
-            // fragment can sit anywhere, including inside the range the caller asked for, with
-            // nothing in this record to say so. Every split entry is a decline, wherever it
-            // lives, rather than a tree that is quietly missing links.
-            if (record.HasAttributeList)
-            {
-                FailureReason = "This volume holds an entry whose attributes are split across MFT fragment records, which this backend does not follow.";
-                return false;
-            }
-
+            // Directory pass keeps directories and nothing else. The directory bit lives
+            // in the base header, never in a fragment, so a non-directory needs no
+            // resolution here: the entry pass resolves full files and hard links (even
+            // outside the root, because an unresolvable split anywhere declines).
             if (!record.IsDirectory)
             {
                 return true;
             }
 
-            List<MftName> names = MftRecordParser.VisibleNames(record.Names);
+            MftRecordInfo logical = record;
+
+            // A logical file whose attributes are split across fragment records is resolved
+            // from its list before anything is placed. A link held only by a fragment can
+            // sit anywhere, including inside the range the caller asked for, so an entry
+            // that cannot be resolved is a decline wherever it lives, rather than a tree
+            // that is quietly missing links.
+            if (record.HasAttributeList)
+            {
+                MftRecordInfo merged = new();
+                if (!MftLogicalFileResolver.TryResolve(record, source, cancellationToken, merged, out string? resolveFailure))
+                {
+                    FailureReason = resolveFailure;
+                    return false;
+                }
+
+                logical = merged;
+            }
+
+            if (!logical.IsDirectory)
+            {
+                return true;
+            }
+
+            List<MftName> names = MftRecordParser.VisibleNames(logical.Names);
             if (names.Count != 1)
             {
                 FailureReason = names.Count == 0
@@ -215,7 +233,7 @@ internal sealed class NtfsMftScanBackend : IScanBackend
                 return false;
             }
 
-            if (map.TryAdd(record, names[0]))
+            if (map.TryAdd(logical, names[0]))
             {
                 return true;
             }
@@ -244,13 +262,17 @@ internal sealed class NtfsMftScanBackend : IScanBackend
             NtfsSizeQuery queryMetadata,
             NtfsDirectoryMap map,
             ScanCollector collector,
-            ScanRequest request)
+            ScanRequest request,
+            IMftRecordSource source)
         {
             _queryMetadata = queryMetadata;
             _map = map;
             _collector = collector;
             _request = request;
+            _source = source;
         }
+
+        private readonly IMftRecordSource _source;
 
         public string? FailureReason { get; private set; }
 
@@ -260,30 +282,48 @@ internal sealed class NtfsMftScanBackend : IScanBackend
             cancellationToken.ThrowIfCancellationRequested();
 
             // Record 5 is the volume root: the node the caller asked to scan, which the
-            // tree builder creates. A fragment belongs to the record that names it.
+            // tree builder creates. A fragment belongs to the record that names it, and is
+            // merged into its base below; it is never emitted on its own.
             if (record.Ordinal == MftRecordParser.VolumeRootRecord || record.IsExtension)
             {
                 return true;
+            }
+
+            MftRecordInfo logical = record;
+
+            // A split entry is resolved before anything is reported, so a name or size
+            // held only by a fragment is not silently dropped. One that cannot be
+            // resolved declines the backend wherever it lives.
+            if (record.HasAttributeList)
+            {
+                MftRecordInfo merged = new();
+                if (!MftLogicalFileResolver.TryResolve(record, _source, cancellationToken, merged, out string? resolveFailure))
+                {
+                    FailureReason = resolveFailure;
+                    return false;
+                }
+
+                logical = merged;
             }
 
             // An entry the caller asked to skip is skipped whether it is a file or a folder,
             // and a skipped folder takes its contents with it because the map never descended
             // into it. The scan root is not filtered here: the portable backend reports a
             // root whatever its attributes, and so does this.
-            if ((record.Attributes & _request.Options.SkipAttributes) != 0)
+            if ((logical.Attributes & _request.Options.SkipAttributes) != 0)
             {
                 _skippedByAttributes++;
                 return true;
             }
 
-            List<MftName> names = MftRecordParser.VisibleNames(record.Names);
+            List<MftName> names = MftRecordParser.VisibleNames(logical.Names);
             List<string> relativePaths = [];
 
             foreach (MftName name in names)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                MftParentStatus status = _map.ResolveParent(name, record.Ordinal, out bool inSubtree, out int depth, out string prefix);
+                MftParentStatus status = _map.ResolveParent(name, logical.Ordinal, out bool inSubtree, out int depth, out string prefix);
 
                 if (status != MftParentStatus.Resolved)
                 {
@@ -315,7 +355,7 @@ internal sealed class NtfsMftScanBackend : IScanBackend
 
             for (int i = 0; i < relativePaths.Count; i++)
             {
-                if (!TryEmit(record, relativePaths[i], isPrimaryName: i == 0, cancellationToken))
+                if (!TryEmit(logical, relativePaths[i], isPrimaryName: i == 0, cancellationToken))
                 {
                     return false;
                 }

@@ -242,7 +242,7 @@ public class NtfsMftRecordParserTests
     [Fact]
     public void AFixupAppliedWalkSourceParsesItsRestoredRecord()
     {
-        MftGeometry geometry = new(4096, 1024, 4096);
+        MftGeometry geometry = new(4096, 4096, 1024, 4096);
         FixtureRecordSource source = new(geometry)
         {
             Representation = MftRecordRepresentation.FixupApplied,
@@ -577,7 +577,7 @@ public class NtfsMftRecordParserTests
     }
 
     [Fact]
-    public void AnAttributeListIsRecordedSoTheBackendCanDecline()
+    public void AnAttributeListIsRecordedForFragmentResolution()
     {
         MftRecordInfo record = Parse(new MftRecordBuilder()
             .AddStandardInformation(FileAttributes.Normal)
@@ -586,6 +586,7 @@ public class NtfsMftRecordParserTests
             .Build());
 
         Assert.True(record.HasAttributeList);
+        Assert.NotEmpty(record.AttributeListEntries);
     }
 
     [Fact]

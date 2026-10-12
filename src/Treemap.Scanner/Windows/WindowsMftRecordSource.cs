@@ -13,7 +13,7 @@ namespace Treemap.Scanning.Windows;
 /// system volume at all; access denied is a decline, not a problem to solve around. Nothing
 /// here escalates and nothing here writes.
 /// </remarks>
-internal sealed class WindowsMftRecordSource : IMftRecordSource
+internal sealed class WindowsMftRecordSource : IMftRecordSource, IMftVolumeReader
 {
     /// <summary>
     /// The whole input is one file reference number. A sequence number of zero says the
@@ -219,5 +219,140 @@ internal sealed class WindowsMftRecordSource : IMftRecordSource
 
         _disposed = true;
         _volume.Dispose();
+    }
+
+    /// <summary>
+    /// Reads raw volume bytes for non-resident attribute-list values. Volume handles are
+    /// non-cached even without <c>FILE_FLAG_NO_BUFFERING</c>, so every read uses a
+    /// sector-aligned unmanaged buffer with a bounded reusable chunk: offsets, counts and
+    /// addresses are sector-sized, bounds are checked before I/O, and nothing writes,
+    /// locks or unmounts. Read-only.
+    /// </summary>
+    public bool TryReadVolume(long volumeByteOffset, byte[] buffer, int offset, int count, out string? failureReason)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        failureReason = null;
+
+        long endOffset;
+        try
+        {
+            checked
+            {
+                endOffset = volumeByteOffset + count;
+            }
+        }
+        catch (OverflowException)
+        {
+            failureReason = $"The volume read at byte {volumeByteOffset} for {count} bytes overflows.";
+            return false;
+        }
+
+        long endBuffer;
+        try
+        {
+            checked
+            {
+                endBuffer = (long)offset + count;
+            }
+        }
+        catch (OverflowException)
+        {
+            failureReason = $"The volume read at byte {volumeByteOffset} for {count} bytes overflows its buffer.";
+            return false;
+        }
+
+        if (volumeByteOffset < 0 || offset < 0 || count < 0 || endBuffer > buffer.Length)
+        {
+            failureReason = $"The volume read at byte {volumeByteOffset} for {count} bytes does not fit its buffer.";
+            return false;
+        }
+
+        if (count == 0)
+        {
+            return true;
+        }
+
+        long sectorSize = Geometry.BytesPerSector;
+        if (sectorSize > 0)
+        {
+            if (volumeByteOffset % sectorSize != 0 || count % sectorSize != 0)
+            {
+                failureReason = $"The volume read at byte {volumeByteOffset} for {count} bytes is not sector-aligned to {sectorSize} bytes.";
+                return false;
+            }
+        }
+
+        long totalBytes = Geometry.TotalVolumeBytes;
+        if (totalBytes > 0 && endOffset > totalBytes)
+        {
+            failureReason = $"The volume read at byte {volumeByteOffset} for {count} bytes runs past the {totalBytes}-byte volume.";
+            return false;
+        }
+
+        // Bounded chunks reused through one aligned temporary buffer rather than two
+        // whole-value copies. One megabyte stays sector-aligned for every supported
+        // sector size (512..64 KiB) and keeps a single outstanding read small.
+        const int MaxChunk = 1024 * 1024;
+        long alignedChunk = sectorSize > 0 ? (MaxChunk / sectorSize) * sectorSize : MaxChunk;
+        if (alignedChunk <= 0)
+        {
+            alignedChunk = sectorSize > 0 ? sectorSize : MaxChunk;
+        }
+
+        int chunkSize = (int)Math.Min(alignedChunk, count);
+        nint raw = nint.Zero;
+        nint aligned = nint.Zero;
+        try
+        {
+            // Over-allocate so the aligned address inside still holds a full chunk.
+            long reserve = (long)chunkSize + sectorSize;
+            raw = Marshal.AllocHGlobal((nint)reserve);
+            long address = raw.ToInt64();
+            long misalignment = sectorSize > 0 ? address % sectorSize : 0;
+            long adjust = misalignment == 0 ? 0 : sectorSize - misalignment;
+            aligned = nint.CreateChecked(address + adjust);
+
+            int done = 0;
+            while (done < count)
+            {
+                int want = Math.Min(chunkSize, count - done);
+                long at = volumeByteOffset + done;
+
+                if (!NativeMethods.SetFilePointerEx(_volume, at, out _, 0))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    failureReason = $"The volume could not seek to byte {at}: {NativeMethods.DescribeError(error)}";
+                    return false;
+                }
+
+                if (!NativeMethods.ReadFileAligned(_volume, aligned, (uint)want, out uint read, 0))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    failureReason = $"The volume could not be read at byte {at}: {NativeMethods.DescribeError(error)}";
+                    return false;
+                }
+
+                if (read != want)
+                {
+                    failureReason = read == 0
+                        ? $"The volume ended reading at byte {at}, short of {count} bytes."
+                        : $"The volume read {read} bytes at byte {at}, short of the {want} bytes asked for and sector alignment.";
+                    return false;
+                }
+
+                Marshal.Copy(aligned, buffer, offset + done, (int)read);
+                done += (int)read;
+            }
+        }
+        finally
+        {
+            if (raw != nint.Zero)
+            {
+                Marshal.FreeHGlobal(raw);
+            }
+        }
+
+        return true;
     }
 }
